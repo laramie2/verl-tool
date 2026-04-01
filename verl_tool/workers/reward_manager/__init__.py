@@ -22,7 +22,7 @@ def get_reward_manager_cls(name):
 # search current directory for reward manager classes
 current_dir = Path(__file__).parent
 for file in current_dir.glob("*.py"):
-    if file.name == "__init__.py":
+    if file.name == "__init__.py" or file.name == "wikiRL_old.py":
         continue
     try:
         # import

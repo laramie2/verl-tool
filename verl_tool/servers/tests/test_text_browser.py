@@ -78,7 +78,7 @@ def test_browser(url: str = "http://localhost:5000/get_observation",
     # Generate two unique trajectory IDs to simulate two parallel agents
     traj_ids = [
         f"{trajectory_id}-{uuid.uuid4()}",
-        f"{trajectory_id}-{uuid.uuid4()}"
+        # f"{trajectory_id}-{uuid.uuid4()}"
     ]
 
     # Action: simple “type” into the search box with element id 16
@@ -87,9 +87,26 @@ def test_browser(url: str = "http://localhost:5000/get_observation",
         "```type [16] [Cristiano Ronaldo] [1]```"
     )
 
-    actions = ["", action_str]
+    # actions = ["", action_str]
+    actions = [""]
 
     # Same metadata for both trajectories
+    # extra_fields = [
+    #     {
+    #         "question": "who plays the wildling woman in game of thrones",
+    #         "golden_answers": ["Natalia Gastiain Tena"],
+    #         "gt": "Natalia Gastiain Tena",
+    #         "id": 41214,
+    #         "index": 41214,
+    #         "split": "train",
+    #         "url": (
+    #             "https://tigerai.ca/wiki/"
+    #             "wikipedia_en_all_maxi_2022-05/A/"
+    #             "User:The_other_Kiwix_guy/Landing"
+    #         )
+    #     }
+    # ] * len(traj_ids)
+
     extra_fields = [
         {
             "question": "who plays the wildling woman in game of thrones",
@@ -99,7 +116,7 @@ def test_browser(url: str = "http://localhost:5000/get_observation",
             "index": 41214,
             "split": "train",
             "url": (
-                "https://tigerai.ca/wiki/"
+                "http://127.0.0.1:22015/"
                 "wikipedia_en_all_maxi_2022-05/A/"
                 "User:The_other_Kiwix_guy/Landing"
             )

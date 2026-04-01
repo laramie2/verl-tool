@@ -344,15 +344,18 @@ class AsyncToolManager:
     
     def _create_tool_processing_task(self, tool_type: str, data: Tuple):
         """Create appropriate task for tool processing (async vs sync)"""
+        logger.info(f"tool_type: {tool_type}, data_length: {len(data[0]) if data else 'N/A'}")
         tool = self.tools[tool_type]
         trajectory_ids, actions, extra_fields = data
         
         # Check if tool has async method
         if hasattr(tool, "aget_observations") and inspect.iscoroutinefunction(tool.aget_observations):
+            logger.info(f"😯😯😯Processing {len(actions)} actions with async tool: {tool_type}")
             return asyncio.create_task(
                 tool.aget_observations(trajectory_ids, actions, extra_fields)
             )
         else:
+            logger.info(f"😯😯😯Processing {len(actions)} actions with sync tool: {tool_type}")
             # Use thread pool for sync methods
             return asyncio.get_event_loop().run_in_executor(
                 self.thread_pool,
@@ -536,6 +539,12 @@ class AsyncToolServer:
             request_data: ActionRequest,
             semaphore_wait_time: float = Depends(get_semaphore)  # Get actual wait time
         ):
+            
+            logger.info(f"🚨🚨🚨 [DEBUG] 收到请求啦！")
+            logger.info(f"👉 trajectory_ids: {request_data.trajectory_ids}")
+            logger.info(f"👉 actions: {request_data.actions}")
+            logger.info(f"👉 extra_fields: {request_data.extra_fields}")
+
             """Main endpoint for processing observations"""
             start_time = time.time()
             request_start_time = getattr(request.state, "start_time", start_time)
@@ -581,6 +590,25 @@ class AsyncToolServer:
                         ),
                         timeout=self.config.request_timeout
                     )
+
+                    # =========================================================
+                    # 🚀 新增的日志打印代码：将后端返回的真实结果输出到日志文件中
+                    # =========================================================
+                    logger.info("✅✅✅ [DEBUG] Action 处理完毕，获取到后端返回结果！")
+                    logger.info(f"🎯 Dones状态: {dones}")
+                    logger.info(f"🎯 Valids状态: {valids}")
+                    
+                    # 防止 observations 太长刷屏，打印数量并截断每个结果的前 300 个字符
+                    if observations:
+                        truncated_obs = [
+                            (str(obs)[:300] + "...(已截断)") if len(str(obs)) > 300 else str(obs) 
+                            for obs in observations
+                        ]
+                        logger.info(f"🎯 Observations (共 {len(observations)} 条): {truncated_obs}")
+                    else:
+                        logger.info("🎯 Observations 为空！")
+                    # =========================================================
+
                 except Exception as e:
                     logger.error(f"Error during action processing: {e}", exc_info=True)
                     raise HTTPException(status_code=500, detail=f"Action processing failed: {str(e)}")

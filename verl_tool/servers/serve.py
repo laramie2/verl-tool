@@ -443,7 +443,7 @@ class WorkerManager:
         if self.log_directory:
             self.log_directory_path = Path(self.log_directory)
         else:
-            self.log_directory_path = Path("tool-server-logs")
+            self.log_directory_path = Path("logs/tool-server-logs")
         self.log_directory_path.mkdir(parents=True, exist_ok=True)
         
     def log_worker_states(self):

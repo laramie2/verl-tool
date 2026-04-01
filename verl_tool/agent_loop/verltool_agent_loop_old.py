@@ -31,9 +31,6 @@ from .vision_utils import decode_image_url, encode_image, encode_image_url
 from verl_tool.utils.dataset.audio_utils import encode_audio_data
 import socket
 
-import textwrap
-from PIL import Image, ImageDraw, ImageFont
-
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -275,7 +272,7 @@ class VerlToolAgentLoop(AgentLoopBase):
                 trace_ctx = {}
 
                 # === [新增打印] 观察发给 Tool Server 的数据 ===
-                # print(f"\n[HTTP POST Payload to Tool Server]:\n{json.dumps(payload, indent=2, ensure_ascii=False)}\n", flush=True)
+                print(f"\n[HTTP POST Payload to Tool Server]:\n{json.dumps(payload, indent=2, ensure_ascii=False)}\n", flush=True)
                 # ============================================
 
                 async with session.post(
@@ -292,7 +289,7 @@ class VerlToolAgentLoop(AgentLoopBase):
                     read_duration = time.time() - read_start
 
                     # ================= [新增打印 2：工具返回的响应] =================
-                    # print(f"\n[HTTP Response from Tool Server]:\n{json.dumps(resp_data, indent=2, ensure_ascii=False)}\n", flush=True)
+                    print(f"\n[HTTP Response from Tool Server]:\n{json.dumps(resp_data, indent=2, ensure_ascii=False)}\n", flush=True)
                     # ==============================================================
                     
                     # Calculate approximate response size
@@ -461,39 +458,6 @@ class VerlToolAgentLoop(AgentLoopBase):
         
         
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
-        request_id = str(uuid4().hex)
-        
-        log_dir = "/data/yutao/lzt/BrowserAgent_v2/verl-tool/examples/train/wikiRL/log"
-        os.makedirs(log_dir, exist_ok=True) 
-        log_filename = os.path.join(log_dir, f"agent_traj_{request_id[-6:]}.txt")
-
-        # # ================= [新增日志：安全解析并查看 kwargs 结构] =================        
-        # with open(log_filename, "a", encoding="utf-8") as f:
-        #     f.write(f"\n{'='*20} [KWARGS DEBUG: {request_id[-6:]}] {'='*20}\n")
-        #     f.write(f"sampling_params: {sampling_params}\n\n")
-            
-        #     for key, value in kwargs.items():
-        #         if isinstance(value, str):
-        #             f.write(f"Key: '{key}' | Type: str | Length: {len(value)}\n")
-        #             f.write(f"   -> Content (Top 500 chars): {value[:500]}\n")
-        #         elif isinstance(value, (list, tuple)):
-        #             f.write(f"Key: '{key}' | Type: {type(value).__name__} | Length: {len(value)}\n")
-        #             # 如果是字符串列表，稍微打印一点内容看看
-        #             if len(value) > 0 and isinstance(value[0], str):
-        #                 f.write(f"   -> Snippet: {value[:2]}\n")
-        #         elif isinstance(value, dict):
-        #             f.write(f"Key: '{key}' | Type: dict | Keys: {list(value.keys())}\n")
-        #             # 如果字典里有看似像文本的 key，也打出来看看
-        #             for sub_k, sub_v in value.items():
-        #                 if isinstance(sub_v, str):
-        #                     f.write(f"      -> {sub_k} (str, len={len(sub_v)}): {sub_v[:200]}\n")
-        #         elif hasattr(value, 'shape'): # 针对 Tensor 或 Numpy array
-        #             f.write(f"Key: '{key}' | Type: Tensor/Array | Shape: {value.shape}\n")
-        #         else:
-        #             f.write(f"Key: '{key}' | Type: {type(value).__name__} | Value: {value}\n")
-        #     f.write(f"{'='*80}\n\n")
-        # # =========================================================================
-        
         prompt_ids = list(kwargs["raw_prompt_ids"])
         multi_modal_data = kwargs.get("multi_modal_data") or {}
         image_data = multi_modal_data.get("image")
@@ -503,17 +467,7 @@ class VerlToolAgentLoop(AgentLoopBase):
         use_tool = kwargs.get("use_tool", self.agent_config.enable_agent)
         
         metrics = {}
-        # request_id = str(uuid4().hex)
-
-        # # ================= [新增日志：确认最原始的训练输入数据] =================        
-        # # 直接解码刚刚拿到的 raw_prompt_ids
-        # absolute_raw_text = self.tokenizer.decode(prompt_ids, skip_special_tokens=False)
-        
-        # with open(log_filename, "a", encoding="utf-8") as f:
-        #     f.write(f"\n{'='*20} [INIT: {request_id[-6:]}] 绝对原始 Prompt (从 kwargs 传入) {'='*20}\n")
-        #     f.write(absolute_raw_text + "\n")
-        #     f.write(f"{'='*80}\n\n")
-        # # =====================================================================
+        request_id = str(uuid4().hex)
         
         stats_dict = {
             "num_turns": 0,
@@ -561,17 +515,6 @@ class VerlToolAgentLoop(AgentLoopBase):
 
         logger.debug(f"Starting agent loop for traj_id={request_id} with use_tool={use_tool}, max_turns={max_turns}, max_response_length={max_response_length}, max_action_length={max_action_length}, max_obs_length={max_obs_length}")
         
-        # ================= [新增日志：记录初始原始 Prompt] =================       
-        # 解码初始 Prompt 文本
-        initial_prompt_text = self.tokenizer.decode(running_prompt_ids, skip_special_tokens=False)
-        
-        with open(log_filename, "a", encoding="utf-8") as f:
-            f.write(f"\n{'#'*30} [TRAJECTORY START: {request_id}] {'#'*30}\n")
-            f.write(f"🚀 [Initial Prompt]:\n")
-            f.write(initial_prompt_text + "\n")
-            f.write(f"{'#'*80}\n\n")
-        # =================================================================
-
         for step in range(max_turns + 1):
             previous_length = len(running_prompt_ids)
             available_length = max(max_response_length - len(running_prompt_ids) + len(prompt_ids), 0)
@@ -597,11 +540,16 @@ class VerlToolAgentLoop(AgentLoopBase):
             gen_logprobs = output.log_probs or [0.0] * len(gen_ids)
             gen_text = output.text
 
-            # ================= [新增日志：写入文件记录模型输出] =================            
-            with open(log_filename, "a", encoding="utf-8") as f:
-                f.write(f"\n{'='*20} [Step {step}] 🤖 模型生成 {'='*20}\n")
-                f.write(gen_text + "\n")
-            # =================================================================
+            # # ================= [新增日志：写入文件记录模型输出] =================
+            # # 使用你指定的绝对路径
+            # log_dir = "/data/yutao/lzt/BrowserAgent_v2/verl-tool/examples/train/deepsearch/log"
+            # os.makedirs(log_dir, exist_ok=True) 
+            # log_filename = os.path.join(log_dir, f"agent_traj_{request_id[-6:]}.txt")
+            
+            # with open(log_filename, "a", encoding="utf-8") as f:
+            #     f.write(f"\n{'='*20} [Step {step}] 🤖 模型生成 {'='*20}\n")
+            #     f.write(gen_text + "\n")
+            # # =================================================================
 
             running_prompt_ids.extend(gen_ids)
             response_mask.extend([1] * len(gen_ids))
@@ -635,25 +583,6 @@ class VerlToolAgentLoop(AgentLoopBase):
                         do_action = True
                         action_text = (gen_text.split(action_stop_token)[0] + action_stop_token)
                         break
-
-            # ================= [新增日志：写入模型输出动作指令] =================               
-            with open(log_filename, "a", encoding="utf-8") as f:
-                f.write(f"\n{'='*20} [Step {step}] 🔧 动作截取 {'='*20}\n")
-                f.write(action_text if action_text.strip() else "[警告：生成了空动作！]\n")
-            # =================================================================
-
-            # ================= [🔧 DEBUG: 硬编码 action_text 并强制触发] ================= 
-            # 覆盖前面大模型的生成结果，强制让 agent 执行测试用动作
-            do_action = True
-#             action_text = """<think>The objective is to find out who plays David's wife in "Once Upon a Time." Since the current page is a landing page and there is no content visible, I should search for "Once Upon a Time" to find the relevant article, which will likely contain cast information. I will use the search box to look for "Once Upon a Time."</think>
-# <action></action>"""
-            action_text = ""
-            
-            with open(log_filename, "a", encoding="utf-8") as f:
-                f.write(f"\n{'='*20} [Step {step}] 🐛 DEBUG: 已覆盖为硬编码动作 {'='*20}\n")
-                f.write(action_text + "\n")
-            # ===========================================================================
-
             # send generated action to tool server
             if do_action and not is_last_step:
                 extra_fields = kwargs.get("extra_info", {}).copy()
@@ -677,59 +606,19 @@ class VerlToolAgentLoop(AgentLoopBase):
                 # process observations and prepare for next turn
                 obs_text = tool_results['obs']
 
-                # ================= [新增日志：写入文件记录工具反馈] =================               
-                with open(log_filename, "a", encoding="utf-8") as f:
-                    f.write(f"\n{'='*20} [Step {step}] 🔧 工具返回 {'='*20}\n")
-                    f.write(obs_text if obs_text.strip() else "[警告：工具返回了空内容！]\n")
-                # =================================================================
-
-
-                # =====================================================================
-                # [新增模块] 视觉上下文压缩拦截器 (Observation-Level Compression)
-                # 作用：将过长的纯文本观测渲染为图片，极大地节省 Context Window Token
-                # =====================================================================
+                # # ================= [新增日志：写入文件记录工具反馈] =================
+                # log_dir = "/data/yutao/lzt/BrowserAgent_v2/verl-tool/examples/train/deepsearch/log"
+                # os.makedirs(log_dir, exist_ok=True)
+                # log_filename = os.path.join(log_dir, f"agent_traj_{request_id[-6:]}.txt")
                 
-                # 设定一个阈值，只有当工具返回的字符数大于这个值时，才进行图片渲染压缩
-                # 你可以把这个阈值配置在 self.agent_config 里
-                COMPRESSION_THRESHOLD = 500 
-                from VTC_tool.VTC_tool import VTCTool
-                vtc = VTCTool()
-                saved_dir = "/data/yutao/lzt/BrowserAgent_v2/verl-tool/logs/compressed_obs"
-                os.makedirs(saved_dir, exist_ok=True)
-                # 如果开启了压缩特性，并且当前返回的纯文本长度超标
-                if getattr(self.agent_config, 'enable_obs_compression', True) and len(obs_text) > COMPRESSION_THRESHOLD:
-                    
-                    # 1. 调用渲染引擎：将冗长的 obs_text 渲染成一张 PIL.Image
-                    # （你需要实现或复用现有的 self.render_text_to_image 方法，类似于 OCR 工具的逆向过程）
-                    compressed_img, _ = vtc.render_text_to_image(obs_text)
-                    compressed_img.save(f"{saved_dir}/compressed_obs_{request_id[-6:]}.png")  # for debugging, save the compressed image
-                    
-                    # 2. 伪装注入：将生成的图片强行挂载到 tool_results 中，伪装成工具原生返回的图片
-                    if 'image' not in tool_results or tool_results['image'] is None:
-                        tool_results['image'] = []
-                    elif not isinstance(tool_results['image'], list):
-                        tool_results['image'] = [tool_results['image']]
-                    
-                    tool_results['image'].append(compressed_img)
-                    
-                    # 3. 文本截断与替换：用极短的提示词和视觉占位符取代原本上千 Token 的文本
-                    # 这里必须包含 "<image>"，因为你下方的原生代码会去检索并替换这个 tag
-                    obs_text = f"System Observation (Compressed): <image>"
-                    tool_results['obs'] = obs_text 
-                    
-                    logger.info(f"Turn {step}: Compressed long observation (length {len(tool_results['obs'])}) into an image to save tokens. Traj_id={request_id}")
-                
-                # =====================================================================
-                # ⬆️⬆️⬆️ 拦截器结束，接下来的原生代码会完美接管 ⬆️⬆️⬆️
-
+                # with open(log_filename, "a", encoding="utf-8") as f:
+                #     f.write(f"\n{'='*20} [Step {step}] 🔧 工具返回 {'='*20}\n")
+                #     f.write(obs_text if obs_text.strip() else "[警告：工具返回了空内容！]\n")
+                # # =================================================================
 
                 if tool_results.get('image', None):
                     images = [tool_results['image']] if not isinstance(tool_results['image'], list) else tool_results['image']
                     decoded_images = [decode_image_url(img_url) for img_url in images]
-
-                    if running_image_data is None:
-                        running_image_data = []
-                        
                     running_image_data.extend(decoded_images)
                     # add image placeholder token ids
                     # first see whether there are <image> tags in obs_text
@@ -740,17 +629,7 @@ class VerlToolAgentLoop(AgentLoopBase):
                         num_image_tags = len(decoded_images)
                     # now replace <image> tags with image placeholder tokens
                     obs_text = obs_text.replace("<image>", self.qwen_image_placeholder, num_image_tags)
-                    # obs_token_ids = self.processor(text=[obs_text], images=decoded_images, return_tensors="pt")["input_ids"].squeeze(0).tolist()
-
-                    # --- 新增：安全检查 processor 是否存在 ---
-                    if self.processor is not None:
-                        # 多模态模型：使用 processor 处理图文
-                        obs_token_ids = self.processor(text=[obs_text], images=decoded_images, return_tensors="pt")["input_ids"].squeeze(0).tolist()
-                    else:
-                        # 纯文本模型：忽略图片，直接对文本进行 tokenize
-                        obs_token_ids = self.tokenizer.encode(obs_text)
-                    # --------------------------------------
-
+                    obs_token_ids = self.processor(text=[obs_text], images=decoded_images, return_tensors="pt")["input_ids"].squeeze(0).tolist()
                     if max_obs_length < len(obs_token_ids):
                         if self.agent_config.truncate_obs_side == 'left':
                             truncation_index = max_obs_length
@@ -848,19 +727,6 @@ class VerlToolAgentLoop(AgentLoopBase):
                     stats_dict["is_traj_finished"] = True
                     traj_stop_reason = "tool_signaled_done"
                     break
-
-                # ================= [🔧 DEBUG: 单步调用后强制跳出循环] ================= 
-                stats_dict["is_traj_finished"] = True
-                traj_stop_reason = "debug_single_step_break"
-                logger.info(f"🐛 DEBUG: 已完成单次 tool server 调用，正在强制跳出循环。Traj_id={request_id}")
-                
-                with open(log_filename, "a", encoding="utf-8") as f:
-                    f.write(f"\n{'='*20} 🐛 DEBUG: 单步跳出 {'='*20}\n")
-                    f.write("已成功阻断循环。\n")
-                break  # 强制结束当前 Agent 的交互循环，立刻进入结算阶段
-                # =========================================================================
-
-
             else:
                 # finish the trajectory
                 if finish_reason == "stop":
