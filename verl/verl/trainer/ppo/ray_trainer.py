@@ -179,6 +179,18 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
+def align_batch_to_rollout_output(batch: DataProto, rollout_output: DataProto) -> DataProto:
+    """Expand or reorder a source batch to match rollout-expanded samples."""
+    parent_indices = rollout_output.non_tensor_batch.get("__parent_batch_index__")
+    if parent_indices is None:
+        return batch
+
+    parent_indices = np.asarray(parent_indices, dtype=np.int64)
+    if len(parent_indices) == len(batch) and np.array_equal(parent_indices, np.arange(len(batch), dtype=np.int64)):
+        return batch
+    return batch[parent_indices.tolist()]
+
+
 def compute_advantage(
     data: DataProto,
     adv_estimator: AdvantageEstimator,
@@ -232,10 +244,11 @@ def compute_advantage(
         grpo_calculation_mask = data.batch["response_mask"]
 
         # Call compute_grpo_outcome_advantage with parameters matching its definition
+        grpo_index = data.non_tensor_batch.get("adv_group_uid", data.non_tensor_batch["uid"])
         advantages, returns = core_algos.compute_grpo_outcome_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
             response_mask=grpo_calculation_mask,
-            index=data.non_tensor_batch["uid"],
+            index=grpo_index,
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
         )
         data.batch["advantages"] = advantages
@@ -248,8 +261,9 @@ def compute_advantage(
             "response_mask": data.batch["response_mask"],
             "config": config,
         }
-        if "uid" in data.non_tensor_batch:  # optional
-            adv_kwargs["index"] = data.non_tensor_batch["uid"]
+        adv_index = data.non_tensor_batch.get("adv_group_uid", data.non_tensor_batch.get("uid"))
+        if adv_index is not None:  # optional
+            adv_kwargs["index"] = adv_index
         if "reward_baselines" in data.batch:  # optional
             adv_kwargs["reward_baselines"] = data.batch["reward_baselines"]
 
@@ -1124,6 +1138,16 @@ class RayPPOTrainer:
                                 gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
                             else:
                                 gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
+                            baseline_parent_indices = gen_baseline_output.non_tensor_batch.get("__parent_batch_index__")
+                            if baseline_parent_indices is not None:
+                                baseline_parent_indices = np.asarray(baseline_parent_indices, dtype=np.int64)
+                                if len(gen_baseline_output) != len(batch) or not np.array_equal(
+                                    baseline_parent_indices,
+                                    np.arange(len(batch), dtype=np.int64),
+                                ):
+                                    raise NotImplementedError(
+                                        "REMAX baseline rollout does not yet support chunk-expanded agent-loop outputs."
+                                    )
                             batch = batch.union(gen_baseline_output)
                             # compute reward model score on batch
                             rm_scores = None
@@ -1141,8 +1165,10 @@ class RayPPOTrainer:
                             batch.batch["reward_baselines"] = reward_baseline_tensor
 
                             del rm_scores, gen_baseline_batch, gen_baseline_output
-                    # repeat to align with repeated responses in rollout
+                    # repeat to align with repeated responses in rollout, then fan out again if the
+                    # rollout further slices each repeated sample into multiple chunk-level samples.
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    batch = align_batch_to_rollout_output(batch, gen_batch_output)
                     batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():

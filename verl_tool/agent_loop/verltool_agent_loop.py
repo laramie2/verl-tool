@@ -125,6 +125,15 @@ class AgentActorConfig:
     # experimental features
     mask_void_traj: bool=False # whether to mask the void trajectory (no tool call and no final answer)
     logprobs: bool=False # whether to return logprobs for each generated token
+    enable_blueprint_rollout: bool=False
+    rollout_phase: str="default"
+    blueprint_max_tokens: int=512
+    blueprint_max_subtasks: int=8
+    subtask_max_turns: int=5
+    blueprint_start_token: str="<blueprint>"
+    blueprint_end_token: str="</blueprint>"
+    subtask_done_token: str="<sub_done>"
+    subtask_fail_token: str="<sub_fail>"
     
 def sanitize_request(obj: Any) -> Any:
     """
@@ -984,12 +993,15 @@ class VerlToolAgentLoop(AgentLoopBase):
     #     return output
 
 
-    async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
-        request_id = str(uuid4().hex)
-        
+    async def _run_legacy_single_rollout(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
+        request_id = kwargs.pop("__request_id__", str(uuid4().hex))
+
         log_dir = str(project_root/f"RL/logs/verltool_agent_loop/{time_str}")
-        os.makedirs(log_dir, exist_ok=True) 
-        log_filename = os.path.join(log_dir, f"agent_traj_{request_id[-6:]}.txt")
+        os.makedirs(log_dir, exist_ok=True)
+        log_filename = kwargs.pop("__log_filename__", os.path.join(log_dir, f"agent_traj_{request_id[-6:]}.txt"))
+        close_tool_session = kwargs.pop("__close_tool_session__", True)
+        max_turns_override = kwargs.pop("__max_turns_override__", None)
+        slice_extra_fields = kwargs.pop("__slice_extra_fields__", {}) or {}
         
         prompt_ids = list(kwargs["raw_prompt_ids"])
         multi_modal_data = kwargs.get("multi_modal_data") or {}
@@ -1031,7 +1043,9 @@ class VerlToolAgentLoop(AgentLoopBase):
             model_inputs = self.processor(**processor_kwargs)
             prompt_ids = model_inputs["input_ids"].squeeze(0).tolist()
         
-        max_turns = self.max_turns if not kwargs.get("validate", False) else self.val_max_turns
+        max_turns = max_turns_override if max_turns_override is not None else (
+            self.max_turns if not kwargs.get("validate", False) else self.val_max_turns
+        )
         max_response_length = self.train_max_response_length if not kwargs.get("validate", False) else self.val_max_response_length
         max_action_length = self.max_action_length or max_response_length
         max_obs_length = self.max_obs_length
@@ -1308,6 +1322,8 @@ class VerlToolAgentLoop(AgentLoopBase):
             # =====================================================================
             do_action = False
             action_text = ""
+            subtask_done = False
+            subtask_fail = False
 
             for ext_token in self.action_extract_tokens:
                 if ext_token in gen_text:
@@ -1315,6 +1331,12 @@ class VerlToolAgentLoop(AgentLoopBase):
                     last_idx = gen_text.rfind(ext_token)
                     action_text = gen_text[:last_idx + len(ext_token)]
                     break
+
+            if slice_extra_fields.get("slice_type") == "action":
+                done_token = getattr(self.agent_config, "subtask_done_token", "<sub_done>")
+                fail_token = getattr(self.agent_config, "subtask_fail_token", "<sub_fail>")
+                subtask_done = bool(done_token and done_token in gen_text)
+                subtask_fail = bool(fail_token and fail_token in gen_text)
             
             # =================================================================
             with open(log_filename, "a", encoding="utf-8") as f:
@@ -1326,6 +1348,11 @@ class VerlToolAgentLoop(AgentLoopBase):
             # [修改点: 4. 结束条件检查 (End Conditions Check)]
             # 模型如果没有产出有效动作，或者达到最大轮数，则停止整个 trajectory 的推演
             # =====================================================================
+            if subtask_done or subtask_fail:
+                stats_dict["is_traj_finished"] = subtask_done
+                traj_stop_reason = "subtask_done" if subtask_done else "subtask_fail"
+                break
+
             if not use_tool:
                 stats_dict["is_traj_finished"] = True
                 traj_stop_reason = f"no_tool-{finish_reason}"
@@ -1384,10 +1411,12 @@ class VerlToolAgentLoop(AgentLoopBase):
         response_ids = running_prompt_ids[len(prompt_ids):]
         assert len(response_ids) == len(response_mask), f"Response ids and mask length mismatch: {len(response_ids)} vs {len(response_mask)}"
         
-        start = time.time()
-        asyncio.create_task(self.close_traj_tool_threads(request_id=request_id))
-        end = time.time()
-        close_traj_time = end - start
+        close_traj_time = 0.0
+        if close_tool_session:
+            start = time.time()
+            asyncio.create_task(self.close_traj_tool_threads(request_id=request_id))
+            end = time.time()
+            close_traj_time = end - start
         
         if self.agent_config.mask_overlong_loss and not stats_dict["is_traj_finished"]:
             response_mask = [0] * len(response_mask)
@@ -1479,6 +1508,13 @@ class VerlToolAgentLoop(AgentLoopBase):
         if running_audio_data is not None:
             multi_modal_output["audio"] = running_audio_data
 
+        output_extra_fields = {
+            "tool_interact_info": stats_dict.get("tool_interact_info", []),
+            "traj_stop_reason": traj_stop_reason,
+            "verl_tool_metrics": verl_tool_metrics,
+        }
+        output_extra_fields.update(slice_extra_fields)
+
         output = AgentLoopOutput(
             prompt_ids=prompt_ids,
             response_ids=response_ids[: self.response_length],
@@ -1487,6 +1523,271 @@ class VerlToolAgentLoop(AgentLoopBase):
             multi_modal_data=multi_modal_output,
             num_turns=stats_dict["num_turns"],
             metrics=metrics,
-            extra_fields={"tool_interact_info": stats_dict.get("tool_interact_info", []), "traj_stop_reason": traj_stop_reason, "verl_tool_metrics": verl_tool_metrics},
+            extra_fields=output_extra_fields,
         )
         return output
+
+    def _resolve_rollout_phase(self, kwargs: dict[str, Any]) -> str:
+        phase = kwargs.get("rollout_phase") or kwargs.get("phase")
+        if phase is None and isinstance(kwargs.get("extra_info"), dict):
+            phase = kwargs["extra_info"].get("rollout_phase") or kwargs["extra_info"].get("phase")
+        if phase is None:
+            phase = getattr(self.agent_config, "rollout_phase", "default")
+        return str(phase).lower()
+
+    def _extract_blueprint_text(self, kwargs: dict[str, Any]) -> Optional[str]:
+        for key in ("blueprint", "fixed_blueprint", "blueprint_text"):
+            val = kwargs.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        extra_info = kwargs.get("extra_info")
+        if isinstance(extra_info, dict):
+            for key in ("blueprint", "fixed_blueprint", "blueprint_text"):
+                val = extra_info.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+        return None
+
+    def _extract_between_markers(self, text: str, start_marker: str, end_marker: str) -> str:
+        if not text:
+            return ""
+        start = text.find(start_marker)
+        end = text.rfind(end_marker)
+        if start != -1 and end != -1 and end > start:
+            return text[start + len(start_marker):end].strip()
+        return text.strip()
+
+    def _parse_blueprint_subtasks(self, blueprint_text: str) -> list[str]:
+        body = self._extract_between_markers(
+            blueprint_text,
+            self.agent_config.blueprint_start_token,
+            self.agent_config.blueprint_end_token,
+        )
+        candidates = []
+        for line in body.splitlines():
+            clean = line.strip()
+            if not clean:
+                continue
+            clean = re.sub(r"^\s*(?:[-*]|\d+[.)]|z_\d+\s*[:：-])\s*", "", clean).strip()
+            if clean:
+                candidates.append(clean)
+        if not candidates and body:
+            candidates = [seg.strip() for seg in re.split(r"[;；]\s*", body) if seg.strip()]
+        max_subtasks = max(1, int(getattr(self.agent_config, "blueprint_max_subtasks", 8) or 8))
+        return candidates[:max_subtasks]
+
+    def _encode_fragment(self, text: str) -> list[int]:
+        if not text:
+            return []
+        return self.tokenizer.encode(text, add_special_tokens=False)
+
+    def _build_subtask_prompt_ids(self, prompt_ids: list[int], blueprint_text: str, subtask_text: str, subtask_idx: int, total_subtasks: int) -> list[int]:
+        fragment = (
+            f"\n{self.agent_config.blueprint_start_token}\n{blueprint_text.strip()}\n{self.agent_config.blueprint_end_token}\n"
+            f"<current_subtask index=\"{subtask_idx + 1}/{total_subtasks}\">\n{subtask_text.strip()}\n</current_subtask>\n"
+        )
+        combined = prompt_ids + self._encode_fragment(fragment)
+        if len(combined) > self.prompt_length:
+            combined = combined[-self.prompt_length:]
+        return combined
+
+    def _make_slice_extra_fields(
+        self,
+        *,
+        source_uid: str,
+        phase: str,
+        slice_type: str,
+        chunk_index: int,
+        total_chunks: int,
+        blueprint_text: str,
+        subtask_text: Optional[str] = None,
+        extra: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        extra_fields = {
+            "rollout_phase": phase,
+            "slice_type": slice_type,
+            "chunk_index": chunk_index,
+            "total_chunks": total_chunks,
+            "chunk_uid": f"{source_uid}::{slice_type}::{chunk_index}",
+            "adv_group_uid": source_uid if slice_type == "blueprint" else f"{source_uid}::subtask::{chunk_index}",
+            "blueprint_text": blueprint_text,
+            "subtask_text": subtask_text,
+        }
+        if extra:
+            extra_fields.update(extra)
+        return extra_fields
+
+    async def _generate_blueprint_slice(
+        self,
+        sampling_params: dict[str, Any],
+        *,
+        request_id: str,
+        log_filename: str,
+        source_uid: str,
+        **kwargs,
+    ) -> AgentLoopOutput:
+        blueprint_sampling_params = sampling_params.copy()
+        blueprint_sampling_params["max_tokens"] = min(
+            int(getattr(self.agent_config, "blueprint_max_tokens", 512) or 512),
+            self.train_max_response_length if not kwargs.get("validate", False) else self.val_max_response_length,
+        )
+        blueprint_kwargs = dict(kwargs)
+        blueprint_kwargs["use_tool"] = False
+        blueprint_output = await self._run_legacy_single_rollout(
+            blueprint_sampling_params,
+            **blueprint_kwargs,
+            __request_id__=request_id,
+            __log_filename__=log_filename,
+            __close_tool_session__=False,
+            __slice_extra_fields__=self._make_slice_extra_fields(
+                source_uid=source_uid,
+                phase="macro",
+                slice_type="blueprint",
+                chunk_index=0,
+                total_chunks=1,
+                blueprint_text="",
+            ),
+        )
+        blueprint_text = self.tokenizer.decode(blueprint_output.response_ids, skip_special_tokens=False).strip()
+        blueprint_output.extra_fields.update(
+            self._make_slice_extra_fields(
+                source_uid=source_uid,
+                phase="macro",
+                slice_type="blueprint",
+                chunk_index=0,
+                total_chunks=1,
+                blueprint_text=blueprint_text,
+            )
+        )
+        return blueprint_output
+
+    async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput | list[AgentLoopOutput]:
+        phase = self._resolve_rollout_phase(kwargs)
+        if phase not in {"macro", "micro"}:
+            return await self._run_legacy_single_rollout(sampling_params, **kwargs)
+
+        request_id = str(uuid4().hex)
+        log_dir = str(project_root/f"RL/logs/verltool_agent_loop/{time_str}")
+        os.makedirs(log_dir, exist_ok=True)
+        log_filename = os.path.join(log_dir, f"agent_traj_{request_id[-6:]}.txt")
+        source_uid = str(kwargs.get("uid", request_id))
+        prompt_ids = list(kwargs["raw_prompt_ids"])
+
+        blueprint_output = None
+        blueprint_text = self._extract_blueprint_text(kwargs)
+        if phase == "macro" or not blueprint_text:
+            blueprint_sampling_params = sampling_params
+            if phase == "micro" and not blueprint_text:
+                blueprint_sampling_params = sampling_params.copy()
+                blueprint_sampling_params["temperature"] = 0.0
+                blueprint_sampling_params["top_p"] = 1.0
+            blueprint_output = await self._generate_blueprint_slice(
+                blueprint_sampling_params,
+                request_id=request_id,
+                log_filename=log_filename,
+                source_uid=source_uid,
+                **kwargs,
+            )
+            blueprint_text = blueprint_output.extra_fields.get("blueprint_text") or self.tokenizer.decode(
+                blueprint_output.response_ids,
+                skip_special_tokens=False,
+            ).strip()
+
+        subtasks = self._parse_blueprint_subtasks(blueprint_text)
+        if not subtasks:
+            subtasks = ["Complete the task."]
+
+        execution_sampling_params = sampling_params.copy()
+        if phase == "macro":
+            execution_sampling_params["temperature"] = 0.0
+            execution_sampling_params["top_p"] = 1.0
+
+        action_outputs: list[AgentLoopOutput] = []
+        execution_summaries = []
+        stop_early = False
+        for subtask_idx, subtask_text in enumerate(subtasks):
+            chunk_prompt_ids = self._build_subtask_prompt_ids(
+                prompt_ids,
+                blueprint_text,
+                subtask_text,
+                subtask_idx,
+                len(subtasks),
+            )
+            chunk_kwargs = dict(kwargs)
+            chunk_kwargs["raw_prompt_ids"] = chunk_prompt_ids
+            chunk_output = await self._run_legacy_single_rollout(
+                execution_sampling_params,
+                **chunk_kwargs,
+                __request_id__=request_id,
+                __log_filename__=log_filename,
+                __close_tool_session__=subtask_idx == len(subtasks) - 1,
+                __max_turns_override__=int(getattr(self.agent_config, "subtask_max_turns", 5) or 5),
+                __slice_extra_fields__=self._make_slice_extra_fields(
+                    source_uid=source_uid,
+                    phase="micro" if phase == "micro" else "macro",
+                    slice_type="action",
+                    chunk_index=subtask_idx,
+                    total_chunks=len(subtasks),
+                    blueprint_text=blueprint_text,
+                    subtask_text=subtask_text,
+                ),
+            )
+            action_outputs.append(chunk_output)
+            execution_summaries.append(
+                {
+                    "chunk_index": subtask_idx,
+                    "subtask_text": subtask_text,
+                    "traj_stop_reason": chunk_output.extra_fields.get("traj_stop_reason"),
+                    "num_turns": chunk_output.num_turns,
+                }
+            )
+            stop_reason = str(chunk_output.extra_fields.get("traj_stop_reason", ""))
+            if any(token in stop_reason for token in ("max_turns", "fail", "tool_signaled_done")) and subtask_idx < len(subtasks) - 1:
+                stop_early = True
+            if stop_early:
+                break
+
+        if stop_early and action_outputs:
+            asyncio.create_task(self.close_traj_tool_threads(request_id=request_id))
+
+        if phase == "macro":
+            assert blueprint_output is not None
+            blueprint_output.extra_fields["execution_summaries"] = execution_summaries
+            blueprint_output.extra_fields["planned_subtasks"] = subtasks
+            blueprint_output.extra_fields["num_executed_subtasks"] = len(execution_summaries)
+            blueprint_output.extra_fields["planned_num_subtasks"] = len(subtasks)
+            blueprint_output.extra_fields["execution_tool_interact_info"] = [
+                chunk_output.extra_fields.get("tool_interact_info", []) for chunk_output in action_outputs
+            ]
+            if action_outputs:
+                blueprint_output.extra_fields["final_traj_stop_reason"] = action_outputs[-1].extra_fields.get("traj_stop_reason")
+            for chunk_output in action_outputs:
+                blueprint_output.metrics.generate_sequences += chunk_output.metrics.generate_sequences
+                blueprint_output.metrics.tool_calls += chunk_output.metrics.tool_calls
+            if not action_outputs:
+                asyncio.create_task(self.close_traj_tool_threads(request_id=request_id))
+            return [blueprint_output]
+
+        if not action_outputs:
+            fallback_kwargs = dict(kwargs)
+            fallback_kwargs["raw_prompt_ids"] = self._build_subtask_prompt_ids(prompt_ids, blueprint_text, subtasks[0], 0, 1)
+            fallback_output = await self._run_legacy_single_rollout(
+                execution_sampling_params,
+                **fallback_kwargs,
+                __request_id__=request_id,
+                __log_filename__=log_filename,
+                __close_tool_session__=True,
+                __max_turns_override__=int(getattr(self.agent_config, "subtask_max_turns", 5) or 5),
+                __slice_extra_fields__=self._make_slice_extra_fields(
+                    source_uid=source_uid,
+                    phase="micro",
+                    slice_type="action",
+                    chunk_index=0,
+                    total_chunks=1,
+                    blueprint_text=blueprint_text,
+                    subtask_text=subtasks[0],
+                ),
+            )
+            return [fallback_output]
+
+        return action_outputs
