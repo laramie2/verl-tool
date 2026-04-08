@@ -440,10 +440,14 @@ class WorkerManager:
         self._shutdown_requested = False
         self.file_handles: List[any] = []
         self.log_directory = log_directory
+
+        from datetime import datetime
+        time_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
         if self.log_directory:
-            self.log_directory_path = Path(self.log_directory)
+            self.log_directory_path = Path(f"{self.log_directory}/tool_server/{time_str}")
         else:
-            self.log_directory_path = Path("logs/tool-server-logs")
+            self.log_directory_path = Path(f"logs/tool-server-logs/{time_str}")
         self.log_directory_path.mkdir(parents=True, exist_ok=True)
         
     def log_worker_states(self):

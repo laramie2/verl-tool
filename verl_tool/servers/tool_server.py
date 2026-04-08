@@ -305,6 +305,9 @@ class AsyncToolManager:
         """Group actions by their assigned tool types"""
         groups = {}
         
+        print(f"😋😋😋tool_types: {list(tool_types)}")
+        print(f"🤓🤓🤓actions:{list(actions)}")
+
         for tool_type in set(tool_types):
             indices = [i for i, t in enumerate(tool_types) if t == tool_type]
             if not indices:
@@ -350,12 +353,12 @@ class AsyncToolManager:
         
         # Check if tool has async method
         if hasattr(tool, "aget_observations") and inspect.iscoroutinefunction(tool.aget_observations):
-            logger.info(f"😯😯😯Processing {len(actions)} actions with async tool: {tool_type}")
+            print(f"😯😯😯Processing {len(actions)} actions with async tool: {tool_type}")
             return asyncio.create_task(
                 tool.aget_observations(trajectory_ids, actions, extra_fields)
             )
         else:
-            logger.info(f"😯😯😯Processing {len(actions)} actions with sync tool: {tool_type}")
+            print(f"😯😯😯Processing {len(actions)} actions with sync tool: {tool_type}")
             # Use thread pool for sync methods
             return asyncio.get_event_loop().run_in_executor(
                 self.thread_pool,
@@ -578,7 +581,7 @@ class AsyncToolServer:
                     if cached_result:
                         logger.debug(f"Returning cached result for request")
                         return cached_result
-                logger.debug(f"received request: trajectory_ids={request_data.trajectory_ids}, actions={[x[-50:] for x in request_data.actions]}, extra_fields={extra_fields}")
+                # logger.debug(f"received request: trajectory_ids={request_data.trajectory_ids}, actions={[x[-50:] for x in request_data.actions]}, extra_fields={extra_fields}")
                 
                 # Process actions with timeout
                 try:
@@ -595,6 +598,7 @@ class AsyncToolServer:
                     # 🚀 新增的日志打印代码：将后端返回的真实结果输出到日志文件中
                     # =========================================================
                     logger.info("✅✅✅ [DEBUG] Action 处理完毕，获取到后端返回结果！")
+                    logger.info(f"🎯 trajectory_ids: {request_data.trajectory_ids}")
                     logger.info(f"🎯 Dones状态: {dones}")
                     logger.info(f"🎯 Valids状态: {valids}")
                     

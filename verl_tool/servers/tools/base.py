@@ -12,6 +12,7 @@ def set_use_tqdm(value: bool):
     use_tqdm = value
 
 def get_tool_cls(tool_type):
+    print(ALL_TOOLS)
     if tool_type in ALL_TOOLS:
         if tool_type == "base":
             return BaseTool

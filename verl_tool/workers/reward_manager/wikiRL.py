@@ -80,7 +80,7 @@ class WikiRLRewardManager:
     #     #     pickle.dump(data, f)
     #     pass
 
-    def __call__(self, data: DataProto, return_dict=False):
+    def __call__(self, data: DataProto):
         """
         Compute scalar rewards for a batch and append per‑sample logs to
         ``reward_manager_history.jsonl``.
@@ -97,19 +97,9 @@ class WikiRLRewardManager:
             "format_score": <float>
         }
         """
-        # check the last step index
-        # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
-        if "rm_scores" in data.batch.keys():
-            if return_dict:
-                reward_extra_keys = data.meta_info.get("reward_extra_keys", [])
-                reward_extra_info = {key: data.non_tensor_batch[key] for key in reward_extra_keys}
-                return {"reward_tensor": data.batch["rm_scores"], "reward_extra_info": reward_extra_info}
-            else:
-                return data.batch["rm_scores"]
-
-        print("💰 wikiRL Reward Manager: computing rewards for a batch...")
-        # print(data)
-        # print(len(data))
+        print("")
+        print(data)
+        print(len(data))
         import pickle
         with open("data_stub_new_qwq.pkl", "wb") as f:
             pickle.dump(data, f)
@@ -125,9 +115,8 @@ class WikiRLRewardManager:
         for i in range(len(data)):
             input_ids = data.batch["input_ids"][i].tolist()
             attention_mask = data.batch["attention_mask"][i].tolist()
-            # 如果找不到，就给当前 batch 每个样本一个空列表
-            action_lens = data.non_tensor_batch.get("action_lengths", [[] for _ in range(len(data))])[i]
-            obs_lens = data.non_tensor_batch.get("obs_lengths", [[] for _ in range(len(data))])[i]
+            action_lens = data.non_tensor_batch["action_lengths"][i]
+            obs_lens = data.non_tensor_batch["obs_lengths"][i]
 
             prompt_len = 2048
             resp_ids   = input_ids[prompt_len:]
@@ -136,7 +125,8 @@ class WikiRLRewardManager:
                 tid for tid, m in zip(resp_ids, resp_mask)
                 if m == 1 and tid not in special_token_ids
             ]
-            resp_text = self.tokenizer.decode(resp_tokens, skip_special_tokens=True).strip()
+            resp_text = self.tokenizer.decode(resp_tokens,
+                                              skip_special_tokens=True).strip()
             response_list.append(resp_text)
 
             cursor, actions, observations = 0, [], []
@@ -173,11 +163,7 @@ class WikiRLRewardManager:
             format_reward  = self.format_score(actions_list[i])
             final_reward   = answer_reward + 0.5 * format_reward
 
-            # reward_tensor[i, valid_resp_len[i].item() - 1] = final_reward
-            # 将 final_reward 填入 sequence 的最后一个有效位置
-            idx = max(0, int(valid_resp_len[i].item()) - 1)
-            reward_tensor[i, idx] = final_reward
-
+            reward_tensor[i, valid_resp_len[i].item() - 1] = final_reward
             answer_scores.append(answer_reward)
             format_scores.append(format_reward)
 
@@ -211,17 +197,7 @@ class WikiRLRewardManager:
         print(f"Computed rewards for {len(data)} samples.")
         print("Answer scores:", answer_scores)
         print("Format scores:", format_scores)
-        
-        if return_dict:
-            return {
-                "reward_tensor": reward_tensor,
-                "reward_extra_info": {
-                    # 把指标以 list 的形式传入，外层会提取 value[0] 记录到 wandb
-                    "wiki_answer_score": answer_scores,
-                    "wiki_format_score": format_scores,
-                }
-            }
-        
+        exit(1)
         return reward_tensor
 
 

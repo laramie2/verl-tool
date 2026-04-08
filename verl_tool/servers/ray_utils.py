@@ -241,33 +241,49 @@ class RayToolManager:
     ) -> Tuple[List[Any], List[bool], List[bool]]:
         """
         Process a group of actions for the same tool type using Ray batch execution.
-        
-        Args:
-            tool_type: Type of tool to use
-            trajectory_ids: List of trajectory IDs for this group
-            actions: List of actions for this group
-            extra_fields: List of extra fields for this group
-            
-        Returns:
-            tuple: (observations, dones, valids) for this group
         """
         tool = self.tools[tool_type]
         
-        # Use batch processing if available, otherwise individual Ray tasks
-        if hasattr(tool, 'get_observations'):
-            # Batch processing
+        # 1. 优先检查并使用纯异步的 aget_observations (解决超时和死锁的终极方案)
+        if hasattr(tool, 'aget_observations'):
+            logger.info(f"😯😯😯Processing {len(actions)} actions with ray tool (ASYNC BATCH): {tool_type}")
+            print(f"🤓🤓🤓actions:{list(actions)}")
+            print(f"😋😋😋extra_fields: {list(extra_fields)}")
+            
+            future = tool.aget_observations.remote(trajectory_ids, actions, extra_fields)
+            # Ray 原生支持直接 await ObjectRef，这是最高效的做法
+            import ray
+            if isinstance(future, ray.ObjectRef):
+                return await future
+            return await self._ray_get_async(future)
+
+        # 2. 如果没有异步批处理，再检查旧的同步 get_observations
+        elif hasattr(tool, 'get_observations'):
+            logger.info(f"😯😯😯Processing {len(actions)} actions with ray tool (SYNC BATCH): {tool_type}")
             future = tool.get_observations.remote(trajectory_ids, actions, extra_fields)
             return await self._ray_get_async(future)
+
+        # 3. 如果连批处理都没有，尝试异步单条执行 aconduct_action
+        elif hasattr(tool, 'aconduct_action'):
+            logger.info(f"😯😯😯Processing {len(actions)} actions with ray tool (ASYNC INDIVIDUAL): {tool_type}")
+            futures = [
+                tool.aconduct_action.remote(tid, action, extra)
+                for tid, action, extra in zip(trajectory_ids, actions, extra_fields)
+            ]
+            import asyncio
+            # 直接使用 asyncio.gather 等待所有 Ray ObjectRefs 完成
+            results = await asyncio.gather(*futures)
+            observations, dones, valids = zip(*results) if results else ([], [], [])
+            return list(observations), list(dones), list(valids)
+
+        # 4. 最底层的兜底：同步单条执行 conduct_action
         else:
-            # Individual processing with Ray parallelization
+            logger.info(f"😯😯😯Processing {len(actions)} actions with ray tool (SYNC INDIVIDUAL): {tool_type}")
             futures = [
                 tool.conduct_action.remote(tid, action, extra)
                 for tid, action, extra in zip(trajectory_ids, actions, extra_fields)
             ]
-            
             results = await self._ray_get_async(futures)
-            
-            # Unpack results
             observations, dones, valids = zip(*results) if results else ([], [], [])
             return list(observations), list(dones), list(valids)
     

@@ -34,8 +34,15 @@ import socket
 import textwrap
 from PIL import Image, ImageDraw, ImageFont
 
+from VTC_tool.VTC_tool import VTCTool
+
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+from pathlib import Path
+project_root = Path(__file__).resolve().parents[3]
+from datetime import datetime
+time_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
 from dataclasses import dataclass
 
@@ -92,6 +99,7 @@ class AgentActorConfig:
     truncate_obs_side: str='middle'
     truncate_response_side: str='left'
     action_stop_tokens: list=None
+    action_extract_tokens: list=None
     mask_observations: bool=True
     force_finish_for_last_turn: bool=False
     enable_mtrl: bool=False
@@ -180,6 +188,18 @@ class VerlToolAgentLoop(AgentLoopBase):
             else:
                 cls.action_stop_tokens = []
 
+            # 新增 action_extract_tokens
+            if getattr(cls.agent_config, 'action_extract_tokens', None) is not None:
+                if os.path.exists(cls.agent_config.action_extract_tokens):
+                    with open(cls.agent_config.action_extract_tokens, 'r') as f:
+                        cls.action_extract_tokens = [x.strip() for x in f.read().split(',') if x.strip()]
+                    logger.info(f"Using action extract tokens: {cls.action_extract_tokens}")
+                else:
+                    raise ValueError(f"action_extract_tokens file not found: {cls.agent_config.action_extract_tokens}")
+            else:
+                # 兼容老版本：如果没传，默认等于 stop_tokens
+                cls.action_extract_tokens = getattr(cls, 'action_stop_tokens', [])
+
             if cls.agent_config.mtrl_sep is None:
                 messages = [{"role": "system", "content": "{obs}"}]
                 cls.agent_config.mtrl_sep = cls.agent_config.turn_end_token + "\n" + cls.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -225,6 +245,8 @@ class VerlToolAgentLoop(AgentLoopBase):
             if cls._class_initialized:
                 return
             cls._class_initialized = True
+
+            cls.vtc = VTCTool()
         
     @classmethod
     async def get_session(cls, timeout_seconds: float) -> aiohttp.ClientSession:
@@ -460,39 +482,514 @@ class VerlToolAgentLoop(AgentLoopBase):
         return 
         
         
+    # async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
+    #     request_id = str(uuid4().hex)
+        
+    #     log_dir = str(project_root/f"RL/logs/verltool_agent_loop/{time_str}")
+    #     os.makedirs(log_dir, exist_ok=True) 
+    #     log_filename = os.path.join(log_dir, f"agent_traj_{request_id[-6:]}.txt")
+        
+    #     prompt_ids = list(kwargs["raw_prompt_ids"])
+    #     multi_modal_data = kwargs.get("multi_modal_data") or {}
+    #     image_data = multi_modal_data.get("image")
+    #     encoded_image_data = [encode_image_url(img) for img in image_data] if image_data is not None else None
+    #     audio_data = multi_modal_data.get("audio")
+    #     encoded_audio_data = [encode_audio_data(audio) for audio in audio_data] if audio_data is not None else None
+    #     use_tool = kwargs.get("use_tool", self.agent_config.enable_agent)
+        
+    #     metrics = {}
+    #     # request_id = str(uuid4().hex)
+
+    #     # # ================= [新增日志：确认最原始的训练输入数据] =================        
+    #     # # 直接解码刚刚拿到的 raw_prompt_ids
+    #     # absolute_raw_text = self.tokenizer.decode(prompt_ids, skip_special_tokens=False)
+        
+    #     # with open(log_filename, "a", encoding="utf-8") as f:
+    #     #     f.write(f"\n{'='*20} [INIT: {request_id[-6:]}] 绝对原始 Prompt (从 kwargs 传入) {'='*20}\n")
+    #     #     f.write(absolute_raw_text + "\n")
+    #     #     f.write(f"{'='*80}\n\n")
+    #     # # =====================================================================
+        
+    #     stats_dict = {
+    #         "num_turns": 0,
+    #         "empty_responses": 0,
+    #         "valid_action": 0,
+    #         "action_lengths": [],
+    #         "action_logps": [],
+    #         "obs_lengths": [],
+    #         "rewards": [],
+    #         "tool_interact_info": [],
+    #         "is_traj_finished": False,
+    #         "valid_traj": 1,
+    #         "retokenization_diff": []
+    #     }
+        
+    #     if image_data or audio_data:
+    #         raw_prompt_text = self.tokenizer.decode(prompt_ids, skip_special_tokens=False)
+    #         processor_kwargs = {"text": [raw_prompt_text], "return_tensors": "pt"}
+    #         if image_data:
+    #             processor_kwargs["images"] = image_data
+    #         if audio_data:
+    #             processor_kwargs["audio"] = audio_data
+    #         model_inputs = self.processor(**processor_kwargs)
+    #         prompt_ids = model_inputs["input_ids"].squeeze(0).tolist()
+        
+    #     max_turns = self.max_turns if not kwargs.get("validate", False) else self.val_max_turns
+    #     max_response_length = self.train_max_response_length if not kwargs.get("validate", False) else self.val_max_response_length
+    #     max_action_length = self.max_action_length or max_response_length
+    #     max_obs_length = self.max_obs_length
+        
+    #     agent_sampling_params = sampling_params.copy()
+    #     agent_sampling_params.update({
+    #         "n": 1,  # already repeated by n times in repeat_inputs_by_n
+    #         "stop": self.action_stop_tokens,  # stop when generated an end of action
+    #         "include_stop_str_in_output": True,
+    #         "logprobs": self.logprobs,
+    #     })
+        
+    #     running_prompt_ids = prompt_ids.copy()
+    #     running_image_data = image_data.copy() if image_data is not None else None
+    #     running_audio_data = audio_data.copy() if audio_data is not None else None
+    #     response_mask = []
+    #     response_logprobs = []
+    #     traj_stop_reason = ""
+
+    #     logger.debug(f"Starting agent loop for traj_id={request_id} with use_tool={use_tool}, max_turns={max_turns}, max_response_length={max_response_length}, max_action_length={max_action_length}, max_obs_length={max_obs_length}")
+        
+    #     # ================= [新增日志：记录初始原始 Prompt] =================       
+    #     # 解码初始 Prompt 文本
+    #     initial_prompt_text = self.tokenizer.decode(running_prompt_ids, skip_special_tokens=False)
+        
+    #     with open(log_filename, "a", encoding="utf-8") as f:
+    #         f.write(f"\n{'#'*30} [TRAJECTORY START: {request_id}] {'#'*30}\n")
+    #         f.write(f"🚀 [Initial Prompt]:\n")
+    #         f.write(initial_prompt_text + "\n")
+    #         f.write(f"{'#'*80}\n\n")
+    #     # =================================================================
+
+    #     for step in range(max_turns + 1):
+    #         previous_length = len(running_prompt_ids)
+    #         available_length = max(max_response_length - len(running_prompt_ids) + len(prompt_ids), 0)
+    #         max_tokens_for_this_turn = min(max_action_length, available_length)
+    #         is_last_step = (step == max_turns)
+    #         if max_tokens_for_this_turn <= 0:
+    #             traj_stop_reason = "max_model_len_exceeded"
+    #             break
+    #         agent_sampling_params["max_tokens"] = max_tokens_for_this_turn # for vllm
+    #         logger.debug(f"Turn {step}: available_length={available_length}, max_tokens_for_this_turn={max_tokens_for_this_turn}")
+    #         # agent_sampling_params["max_new_tokens"] = max_tokens_for_this_turn # for sglang
+    #         with simple_timer("generate_sequences", metrics):
+    #             output = await self.server_manager.generate(
+    #                 request_id=request_id,
+    #                 prompt_ids=running_prompt_ids,
+    #                 sampling_params=agent_sampling_params,
+    #                 image_data=running_image_data,
+    #                 audio_data=running_audio_data,
+    #             ) # request_id here should be unique for each generate call, otherwise vllm can generate empty response
+    #             if output.text.strip() == "":
+    #                 logger.warning(f"Turn {step}: Generated empty response for traj_id={request_id}. prompt_ids length: {len(running_prompt_ids)}")
+    #         gen_ids = output.token_ids
+    #         gen_logprobs = output.log_probs or [0.0] * len(gen_ids)
+    #         gen_text = output.text
+
+    #         # ================= [新增日志：写入文件记录模型输出] =================            
+    #         with open(log_filename, "a", encoding="utf-8") as f:
+    #             f.write(f"\n{'='*20} [Step {step}] 🤖 模型生成 {'='*20}\n")
+    #             f.write(gen_text + "\n")
+    #         # =================================================================
+
+    #         running_prompt_ids.extend(gen_ids)
+    #         response_mask.extend([1] * len(gen_ids))
+    #         response_logprobs.extend(gen_logprobs)
+            
+    #         stats_dict["num_turns"] += 1
+    #         stats_dict["action_lengths"].append(len(gen_ids))
+    #         stats_dict["action_logps"].append(np.mean(gen_logprobs) if len(gen_logprobs) > 0 else 0.0)
+    #         if gen_text.strip() == "":
+    #             stats_dict["empty_responses"] += 1
+            
+    #         finish_reason = output.finish_reason
+    #         stop_reason = output.stop_reason
+    #         if isinstance(stop_reason, int):
+    #             print(f"Turn {step}: stop_reason is int: {stop_reason}")
+    #             stop_reason = self.tokenizer.decode([stop_reason])[0]
+            
+    #         if not use_tool:
+    #             # only one turn generation
+    #             stats_dict["is_traj_finished"] = True
+    #             traj_stop_reason = f"no_tool-{finish_reason}"
+    #             break
+            
+    #         # judge whether to interact with tool or finish
+    #         do_action = False
+    #         action_text = ""
+
+    #         # 不再强依赖 finish_reason == "stop"，只要输出里包含了提取符就算作动作
+    #         for ext_token in self.action_extract_tokens:
+    #             if ext_token in gen_text:
+    #                 do_action = True
+                    
+    #                 # 核心优化：使用 rfind 找到最后一次出现 ext_token 的位置
+    #                 # 比如模型输出: "思考过程... ```click[id=1]```"
+    #                 # ext_token 是 "```"
+    #                 last_idx = gen_text.rfind(ext_token)
+                    
+    #                 # 截取到最后那个 ``` 的末尾
+    #                 action_text = gen_text[:last_idx + len(ext_token)]
+    #                 break
+
+    #         # ================= [新增日志：写入模型输出动作指令] =================               
+    #         with open(log_filename, "a", encoding="utf-8") as f:
+    #             f.write(f"\n{'='*20} [Step {step}] 🔧 动作截取 {'='*20}\n")
+    #             f.write(action_text if action_text.strip() else "[警告：生成了空动作！]\n")
+    #         # =================================================================
+
+    #         # send generated action to tool server
+    #         if do_action and not is_last_step:
+    #             extra_fields = kwargs.get("extra_info", {}).copy()
+    #             # if encoded_image_data is not None:
+    #             #     extra_fields["images"] = encoded_image_data
+    #             # if encoded_audio_data is not None:
+    #             #     extra_fields["audio"] = encoded_audio_data
+    #             logger.info(f"Turn {step}: finish_reason={finish_reason}, stop_reason={stop_reason}, do_action={do_action}, action_text={json.dumps(action_text[-50:])}")
+    #             start = metrics.get("tool_calls", 0.0)
+    #             with simple_timer("tool_calls", metrics):
+    #                 tool_results = await self.interact_with_tool_server(
+    #                     traj_id=request_id,
+    #                     action=action_text,
+    #                     do_action=do_action,
+    #                     extra_fields=extra_fields,
+    #                     is_last_step=is_last_step,
+    #                 )
+    #             end = metrics.get("tool_calls", 0.0)
+    #             tool_results['interact_time_ms'] = (end - start) * 1000.0
+                
+    #             # process observations and prepare for next turn
+    #             obs_text = tool_results['obs']
+
+    #             # ================= [新增日志：写入文件记录工具反馈] =================               
+    #             with open(log_filename, "a", encoding="utf-8") as f:
+    #                 f.write(f"\n{'='*20} [Step {step}] 🔧 工具返回 {'='*20}\n")
+    #                 f.write(obs_text if obs_text.strip() else "[警告：工具返回了空内容！]\n")
+    #             # =================================================================
+
+
+    #             # =====================================================================
+    #             # [新增模块] 视觉上下文压缩拦截器 (Observation-Level Compression)
+    #             # 作用：将过长的纯文本观测渲染为图片，极大地节省 Context Window Token
+    #             # =====================================================================
+                
+    #             COMPRESSION_THRESHOLD = 0 
+                
+    #             if getattr(self.agent_config, 'enable_obs_compression', True) and len(obs_text) > COMPRESSION_THRESHOLD:
+    #                 saved_dir = str(project_root/f"RL/logs/verltool_agent_loop/{time_str}/obs_img")
+    #                 os.makedirs(saved_dir, exist_ok=True)
+                    
+    #                 # 1. 异步执行 CPU 密集型渲染，防止卡死事件循环
+    #                 loop = asyncio.get_event_loop()
+    #                 compressed_img, _ = await loop.run_in_executor(
+    #                     None, 
+    #                     self.vtc.render_text_to_image, 
+    #                     obs_text
+    #                 )
+                    
+    #                 # 异步保存图片 (加入 step 防止覆盖)
+    #                 img_path = f"{saved_dir}/compressed_obs_{request_id[-6:]}_step{step}.png"
+    #                 await loop.run_in_executor(None, compressed_img.save, img_path)
+                    
+    #                 # 2. 将图片转换为原生框架支持的 Base64 格式，防止 decode_image_url 崩溃
+    #                 import io
+    #                 import base64
+    #                 buffered = io.BytesIO()
+    #                 compressed_img.save(buffered, format="PNG")
+    #                 img_b64_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+    #                 img_data_uri = f"data:image/png;base64,{img_b64_str}"
+                    
+    #                 # 3. 安全注入到 tool_results
+    #                 if 'image' not in tool_results or tool_results['image'] is None:
+    #                     tool_results['image'] = []
+    #                 elif not isinstance(tool_results['image'], list):
+    #                     tool_results['image'] = [tool_results['image']]
+                        
+    #                 tool_results['image'].append(img_data_uri) # 传入 URI 而不是 PIL 对象
+                    
+    #                 # 4. 替换文本观测
+    #                 obs_text = f"System Observation (Compressed): <image>"
+    #                 tool_results['obs'] = obs_text 
+                    
+    #                 logger.info(f"Turn {step}: Compressed long observation into an image. Saved to {img_path}")
+    #             # =====================================================================
+
+    #             if tool_results.get('image', None):
+    #                 images = [tool_results['image']] if not isinstance(tool_results['image'], list) else tool_results['image']
+    #                 decoded_images = [decode_image_url(img_url) for img_url in images]
+
+    #                 if running_image_data is None:
+    #                     running_image_data = []
+                        
+    #                 running_image_data.extend(decoded_images)
+    #                 # add image placeholder token ids
+    #                 # first see whether there are <image> tags in obs_text
+    #                 num_image_tags = obs_text.count("<image>")
+    #                 if num_image_tags < len(decoded_images):
+    #                     # append at the end
+    #                     obs_text += "<image>" * (len(decoded_images) - num_image_tags)
+    #                     num_image_tags = len(decoded_images)
+    #                 # now replace <image> tags with image placeholder tokens
+    #                 obs_text = obs_text.replace("<image>", self.qwen_image_placeholder, num_image_tags)
+    #                 # obs_token_ids = self.processor(text=[obs_text], images=decoded_images, return_tensors="pt")["input_ids"].squeeze(0).tolist()
+
+    #                 # --- 新增：安全检查 processor 是否存在 ---
+    #                 if self.processor is not None:
+    #                     # 多模态模型：使用 processor 处理图文
+    #                     obs_token_ids = self.processor(text=[obs_text], images=decoded_images, return_tensors="pt")["input_ids"].squeeze(0).tolist()
+    #                 else:
+    #                     # 纯文本模型：忽略图片，直接对文本进行 tokenize
+    #                     obs_token_ids = self.tokenizer.encode(obs_text)
+    #                 # --------------------------------------
+
+    #                 if max_obs_length < len(obs_token_ids):
+    #                     if self.agent_config.truncate_obs_side == 'left':
+    #                         truncation_index = max_obs_length
+    #                         if obs_token_ids[max_obs_length] in self.non_truncate_token_ids:
+    #                             # find the nearest non-truncate token id before max_obs_length
+    #                             truncation_index = max_obs_length - 1
+    #                             while truncation_index > 0 and obs_token_ids[truncation_index] in self.non_truncate_token_ids:
+    #                                 truncation_index -= 1
+    #                         obs_token_ids = obs_token_ids[:truncation_index]
+    #                         obs_token_ids.extend(self.tokenizer.encode("...(truncated)"))
+    #                     else:
+    #                         raise NotImplementedError(f"Only left truncation is supported for multimodal observations for now.")
+    #             elif tool_results.get('audio', None):
+    #                 audios = [tool_results['audio']] if not isinstance(tool_results['audio'], list) else tool_results['audio']
+    #                 decoded_audios = [decode_image_url(audio_url) for audio_url in audios]
+    #                 running_audio_data.extend(decoded_audios)
+    #                 # add audio placeholder token ids
+    #                 # first see whether there are <audio> tags in obs_text
+    #                 num_audio_tags = obs_text.count("<audio>")
+    #                 if num_audio_tags < len(decoded_audios):
+    #                     # append at the end
+    #                     obs_text += "<audio>" * (len(decoded_audios) - num_audio_tags)
+    #                     num_audio_tags = len(decoded_audios)
+    #                 # now replace <audio> tags with audio placeholder tokens
+    #                 obs_text = obs_text.replace("<audio>", self.qwen_audio_placeholder, num_audio_tags)
+    #                 # for mtrl
+    #                 if self.enable_mtrl:
+    #                     obs_text = self.mtrl_sep.format(obs=obs_text)
+    #                 obs_token_ids = self.processor(text=[obs_text], audio=decoded_audios, return_tensors="pt")["input_ids"].squeeze(0).tolist()
+    #                 # obs_token_ids = obs_token_ids[:max_obs_length]
+    #                 if max_obs_length < len(obs_token_ids):
+    #                     if self.agent_config.truncate_obs_side == 'left':
+    #                         truncation_index = max_obs_length
+    #                         if obs_token_ids[max_obs_length] in self.non_truncate_token_ids:
+    #                             # find the nearest non-truncate token id before max_obs_length
+    #                             truncation_index = max_obs_length - 1
+    #                             while truncation_index > 0 and obs_token_ids[truncation_index] in self.non_truncate_token_ids:
+    #                                 truncation_index -= 1
+    #                         obs_token_ids = obs_token_ids[:truncation_index]
+    #                         obs_token_ids.extend(self.tokenizer.encode("...(truncated)"))
+    #                     else:
+    #                         raise NotImplementedError(f"Only left truncation is supported for multimodal observations for now.")
+    #             else:
+    #                 obs_token_ids = self.tokenizer.encode(obs_text)
+    #                 if max_obs_length < len(obs_token_ids):
+    #                     if self.agent_config.truncate_obs_side == 'left':
+    #                         obs_token_ids = obs_token_ids[-max_obs_length:]
+    #                         obs_token_ids.extend(self.tokenizer.encode("...(truncated)"))
+    #                     elif self.agent_config.truncate_obs_side == 'right':
+    #                         obs_token_ids = obs_token_ids[:max_obs_length]
+    #                         obs_token_ids.extend(self.tokenizer.encode("(truncated)..."))
+    #                     elif self.agent_config.truncate_obs_side == 'middle':
+    #                         half_len = max_obs_length // 2
+    #                         obs_token_ids = obs_token_ids[:half_len] + self.tokenizer.encode("...(truncated)...") + obs_token_ids[-half_len:]
+    #                     else:
+    #                         raise ValueError(f"Invalid truncate_obs_side: {self.agent_config.truncate_obs_side}")
+                
+    #             if self.enable_mtrl:
+    #                 obs_token_ids = self.mtrl_sep_prefix_ids + obs_token_ids + self.mtrl_sep_suffix_ids
+    #             # update stats
+    #             stats_dict["obs_lengths"].append(len(obs_token_ids))
+    #             if 'reward' in tool_results and tool_results['reward'] is not None:
+    #                 stats_dict["rewards"].append(tool_results['reward'] if 'reward' in tool_results else 0.0)
+    #             stats_dict["valid_action"] += tool_results['valid_action'] if 'valid_action' in tool_results else 0
+    #             stats_dict["tool_interact_info"].append(tool_results)
+                
+    #             # update running prompt
+    #             running_prompt_ids.extend(obs_token_ids)
+    #             if self.agent_config.mask_observations:
+    #                 response_mask.extend([0] * len(obs_token_ids))
+    #             else:
+    #                 response_mask.extend([1] * len(obs_token_ids))
+    #             response_logprobs.extend([0.0] * len(obs_token_ids)) # pad with 0.0 logprobs for observations
+                
+    #             if self.agent_config.retokenization:
+    #                 new_text = self.tokenizer.decode(running_prompt_ids[previous_length:], skip_special_tokens=False)
+    #                 new_ids = self.tokenizer.encode(new_text)
+    #                 if new_ids != running_prompt_ids[previous_length:]:
+    #                     stats_dict['retokenization_diff'].append(1)
+    #                     logger.debug(f"Retokenization changed the length from {len(running_prompt_ids) - previous_length} to {len(new_ids)}. traj_id={request_id}, turn={step}")
+    #                 else:
+    #                     stats_dict['retokenization_diff'].append(0)
+    #                 running_prompt_ids = running_prompt_ids[:previous_length] + new_ids
+    #                 if len(response_mask) > (len(running_prompt_ids) - len(prompt_ids)):
+    #                     response_mask = response_mask[:len(running_prompt_ids) - len(prompt_ids)]
+    #                 else:
+    #                     response_mask.extend([response_mask[-1]] * (len(running_prompt_ids) - len(prompt_ids) - len(response_mask)))
+    #                 if len(response_logprobs) > (len(running_prompt_ids) - len(prompt_ids)):
+    #                     response_logprobs = response_logprobs[:len(running_prompt_ids) - len(prompt_ids)]
+    #                 else:
+    #                     response_logprobs.extend([0.0] * (len(running_prompt_ids) - len(prompt_ids) - len(response_logprobs)))
+
+    #             if tool_results['done']:
+    #                 # finish the trajectory
+    #                 stats_dict["is_traj_finished"] = True
+    #                 traj_stop_reason = "tool_signaled_done"
+    #                 break
+
+    #         else:
+    #             # finish the trajectory
+    #             if finish_reason == "stop":
+    #                 if not stop_reason:
+    #                     stats_dict["is_traj_finished"] = True
+    #                     if gen_text.strip() == "":
+    #                         traj_stop_reason = "model_chose_to_finish_with_empty_response"
+    #                     else:
+    #                         traj_stop_reason = "model_chose_to_finish"
+    #                 else:
+    #                     stats_dict["is_traj_finished"] = False
+    #                     if do_action and is_last_step:
+    #                         traj_stop_reason = "max_turns_reached"
+    #                     else:
+    #                         traj_stop_reason = "no_action_stop_token_found_in_stop_reason=" + stop_reason
+    #             elif finish_reason == "length":
+    #                 stats_dict["is_traj_finished"] = False
+    #                 traj_stop_reason = "max_response_length_reached"
+    #             else:
+    #                 stats_dict["is_traj_finished"] = True
+    #                 traj_stop_reason = f"finish_reason_{finish_reason}"
+    #             break
+        
+    #     logger.debug(f"Trajectory {request_id} finished after {step} turns. Stop reason: {traj_stop_reason}")
+    #     response_ids = running_prompt_ids[len(prompt_ids):]
+    #     assert len(response_ids) == len(response_mask), f"Response ids and mask length mismatch: {len(response_ids)} vs {len(response_mask)}"
+    #     start = time.time()
+    #     # let close traj run in background but don't wait
+    #     asyncio.create_task(self.close_traj_tool_threads(request_id=request_id))
+    #     # await self.close_traj_tool_threads(request_id=request_id)
+    #     end = time.time()
+    #     close_traj_time = end - start
+        
+    #     if self.agent_config.mask_overlong_loss and not stats_dict["is_traj_finished"]:
+    #         # mask the whole response
+    #         response_mask = [0] * len(response_mask)
+    #         stats_dict["valid_traj"] = 0
+    #         logger.info(f"Masking the whole response for traj_id={request_id} due to overlong trajectory and not finished.")
+        
+        
+    #     if self.agent_config.mask_void_traj:
+    #         response_text = self.tokenizer.decode(response_ids, skip_special_tokens=True).strip()
+    #         has_answer = "\\boxed" in response_text or "final_answer(" in response_text
+    #         if stats_dict["valid_action"] == 0 and not has_answer:
+    #             # mask the whole response
+    #             response_mask = [0] * len(response_mask)
+    #             stats_dict["valid_traj"] = 0
+    #             logger.info(f"Masking the whole response for traj_id={request_id} due to void trajectory (no valid action or no final answer). valid_action={stats_dict['valid_action']}, has_answer={has_answer}")
+            
+    #     verl_tool_metrics = {
+    #         "num_turns": stats_dict["num_turns"],
+    #         "empty_responses": stats_dict["empty_responses"],
+    #         "valid_action": stats_dict["valid_action"],
+    #         "per_action_length": np.mean(stats_dict["action_lengths"]) if len(stats_dict["action_lengths"]) > 0 else 0,
+    #         "per_obs_length": np.mean(stats_dict["obs_lengths"]) if len(stats_dict["obs_lengths"]) > 0 else 0,
+    #         "per_action_logp": np.mean(stats_dict["action_logps"]) if len(stats_dict["action_logps"]) > 0 else 0,
+    #         "per_reward_from_tool": np.mean(stats_dict["rewards"]) if len(stats_dict["rewards"]) > 0 else 0,
+    #         "tool_call_success": np.mean([info.get("success", 1.0) for info in stats_dict["tool_interact_info"]]) if len(stats_dict["tool_interact_info"]) > 0 else 1.0,
+    #         "traj_actions_length": sum(stats_dict["action_lengths"]),
+    #         "traj_obs_length": sum(stats_dict["obs_lengths"]),
+    #         "generated_length": len(output.token_ids),
+    #         "is_traj_finished": float(stats_dict["is_traj_finished"]),
+    #         "valid_traj": float(stats_dict["valid_traj"]),
+    #         "no_loss_on_traj": response_mask.count(1) == 0,
+    #         "retokenization_diff": np.mean(stats_dict["retokenization_diff"]) if len(stats_dict["retokenization_diff"]) > 0 else 0,
+    #         "tool_processing_time_sec": sum(info.get("processing_time_ms", 0.0) for info in stats_dict["tool_interact_info"]) / 1000.0,
+    #         "tool_queue_time_sec": sum(info.get("queue_time_ms", 0.0) for info in stats_dict["tool_interact_info"]) / 1000.0,
+    #         "client_queued_time_sec": sum(info.get("client_queued_ms", 0.0) for info in stats_dict["tool_interact_info"]) / 1000.0,
+    #         "client_conn_create_time_sec": sum(info.get("client_conn_create_ms", 0.0) for info in stats_dict["tool_interact_info"]) / 1000.0,
+    #         "client_request_send_time_sec": sum(info.get("client_request_send_ms", 0.0) for info in stats_dict["tool_interact_info"]) / 1000.0,
+    #         "response_read_time_sec": sum(info.get("response_read_ms", 0.0) for info in stats_dict["tool_interact_info"]) / 1000.0,
+    #         "response_size_mb": sum(info.get("response_size_mb", 0.0) for info in stats_dict["tool_interact_info"]),
+    #         "response_await_time_sec": sum(info.get("time awaiting response_ms", 0.0) for info in stats_dict["tool_interact_info"]) / 1000.0,
+    #         "interact_time_time_sec": sum(info.get("interact_time_ms", 0.0) for info in stats_dict["tool_interact_info"]) / 1000.0,
+    #         "session_request_time": sum(info.get("session_request_time", 0.0) for info in stats_dict["tool_interact_info"]),
+    #         "X-Process-Time_sec": sum(info.get("X-Process-Time", 0.0) for info in stats_dict["tool_interact_info"]),
+    #         "close_traj_time": close_traj_time,
+    #     }
+    #     # additional metrics in tool_interact_info can be added later
+    #     if stats_dict["tool_interact_info"] and all("metrics" in info for info in stats_dict["tool_interact_info"]):
+    #         # do mean aggregation for each metric key
+    #         tool_metric_keys = stats_dict["tool_interact_info"][0]["metrics"].keys()
+    #         for key in tool_metric_keys:
+    #             try:
+    #                 verl_tool_metrics[f"tool_avg_{key}"] = np.mean([float(info["metrics"][key]) for info in stats_dict["tool_interact_info"] if key in info["metrics"]])
+    #             except Exception as e:
+    #                 logger.warning(f"Failed to compute mean for tool metric {key}: {e}")
+    #     # additional per-turn logp
+    #     for i, logp in enumerate(stats_dict["action_logps"]):
+    #         verl_tool_metrics[f"turn_{i+1}_action_logp"] = logp
+        
+    #     # Safely truncate final response so that we do not cut through multimodal placeholder tokens.
+    #     # Here we treat `cut_index` as "the first index to be dropped", so the last kept index is `cut_index - 1`.
+    #     if len(response_ids) > self.response_length:
+    #         cut_index = self.response_length
+    #         last_keep = cut_index - 1
+    #         if last_keep >= 0 and response_ids[last_keep] in self.non_truncate_token_ids:
+    #             # Step backwards over a contiguous block of placeholder tokens so that
+    #             # we either keep the whole block (if it is fully within the limit) or
+    #             # drop it entirely when it would otherwise be partially kept.
+    #             while last_keep >= 0 and response_ids[last_keep] in self.non_truncate_token_ids:
+    #                 last_keep -= 1
+    #             cut_index = last_keep + 1
+    #         response_ids = response_ids[:cut_index]
+    #         response_mask = response_mask[:cut_index]
+    #         response_logprobs = response_logprobs[:cut_index]
+
+    #     # Keep image features aligned with tokens to avoid tokens/features mismatch
+    #     # errors in models such as Qwen3-VL.
+    #     # Count only the tokens that will actually be fed to the model
+    #     # (prompt_ids + truncated response_ids), and approximate available image
+    #     # segments by counting contiguous token: <|vision_start|>
+    #     if running_image_data is not None:
+    #         full_ids = prompt_ids + response_ids
+    #         vision_start_id = self.tokenizer.convert_tokens_to_ids("<|vision_start|>")
+    #         num_visual_segments = full_ids.count(vision_start_id)
+    #         if len(running_image_data) > num_visual_segments:
+    #             running_image_data = running_image_data[:num_visual_segments]
+        
+    #     multi_modal_output = {}
+    #     if running_image_data is not None:
+    #         multi_modal_output["image"] = running_image_data
+    #     if running_audio_data is not None:
+    #         multi_modal_output["audio"] = running_audio_data
+
+    #     output = AgentLoopOutput(
+    #         prompt_ids=prompt_ids,
+    #         response_ids=response_ids[: self.response_length],
+    #         response_mask=response_mask[: self.response_length],
+    #         response_logprobs=response_logprobs[: self.response_length],
+    #         multi_modal_data=multi_modal_output,
+    #         num_turns=stats_dict["num_turns"],
+    #         metrics=metrics,
+    #         extra_fields={"tool_interact_info": stats_dict.get("tool_interact_info", []), "traj_stop_reason": traj_stop_reason, "verl_tool_metrics": verl_tool_metrics},
+    #     )
+    #     return output
+
+
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         request_id = str(uuid4().hex)
         
-        log_dir = "/data/yutao/lzt/BrowserAgent_v2/verl-tool/examples/train/wikiRL/log"
+        log_dir = str(project_root/f"RL/logs/verltool_agent_loop/{time_str}")
         os.makedirs(log_dir, exist_ok=True) 
         log_filename = os.path.join(log_dir, f"agent_traj_{request_id[-6:]}.txt")
-
-        # # ================= [新增日志：安全解析并查看 kwargs 结构] =================        
-        # with open(log_filename, "a", encoding="utf-8") as f:
-        #     f.write(f"\n{'='*20} [KWARGS DEBUG: {request_id[-6:]}] {'='*20}\n")
-        #     f.write(f"sampling_params: {sampling_params}\n\n")
-            
-        #     for key, value in kwargs.items():
-        #         if isinstance(value, str):
-        #             f.write(f"Key: '{key}' | Type: str | Length: {len(value)}\n")
-        #             f.write(f"   -> Content (Top 500 chars): {value[:500]}\n")
-        #         elif isinstance(value, (list, tuple)):
-        #             f.write(f"Key: '{key}' | Type: {type(value).__name__} | Length: {len(value)}\n")
-        #             # 如果是字符串列表，稍微打印一点内容看看
-        #             if len(value) > 0 and isinstance(value[0], str):
-        #                 f.write(f"   -> Snippet: {value[:2]}\n")
-        #         elif isinstance(value, dict):
-        #             f.write(f"Key: '{key}' | Type: dict | Keys: {list(value.keys())}\n")
-        #             # 如果字典里有看似像文本的 key，也打出来看看
-        #             for sub_k, sub_v in value.items():
-        #                 if isinstance(sub_v, str):
-        #                     f.write(f"      -> {sub_k} (str, len={len(sub_v)}): {sub_v[:200]}\n")
-        #         elif hasattr(value, 'shape'): # 针对 Tensor 或 Numpy array
-        #             f.write(f"Key: '{key}' | Type: Tensor/Array | Shape: {value.shape}\n")
-        #         else:
-        #             f.write(f"Key: '{key}' | Type: {type(value).__name__} | Value: {value}\n")
-        #     f.write(f"{'='*80}\n\n")
-        # # =========================================================================
         
         prompt_ids = list(kwargs["raw_prompt_ids"])
         multi_modal_data = kwargs.get("multi_modal_data") or {}
@@ -503,17 +1000,12 @@ class VerlToolAgentLoop(AgentLoopBase):
         use_tool = kwargs.get("use_tool", self.agent_config.enable_agent)
         
         metrics = {}
-        # request_id = str(uuid4().hex)
 
-        # # ================= [新增日志：确认最原始的训练输入数据] =================        
-        # # 直接解码刚刚拿到的 raw_prompt_ids
-        # absolute_raw_text = self.tokenizer.decode(prompt_ids, skip_special_tokens=False)
-        
-        # with open(log_filename, "a", encoding="utf-8") as f:
-        #     f.write(f"\n{'='*20} [INIT: {request_id[-6:]}] 绝对原始 Prompt (从 kwargs 传入) {'='*20}\n")
-        #     f.write(absolute_raw_text + "\n")
-        #     f.write(f"{'='*80}\n\n")
-        # # =====================================================================
+        # 预先初始化一个空的 output 对象，防止因为提前 break 导致后面引用报错
+        class DummyOutput:
+            def __init__(self):
+                self.token_ids = []
+        output = DummyOutput()
         
         stats_dict = {
             "num_turns": 0,
@@ -546,8 +1038,8 @@ class VerlToolAgentLoop(AgentLoopBase):
         
         agent_sampling_params = sampling_params.copy()
         agent_sampling_params.update({
-            "n": 1,  # already repeated by n times in repeat_inputs_by_n
-            "stop": self.action_stop_tokens,  # stop when generated an end of action
+            "n": 1,
+            "stop": self.action_stop_tokens,
             "include_stop_str_in_output": True,
             "logprobs": self.logprobs,
         })
@@ -561,167 +1053,111 @@ class VerlToolAgentLoop(AgentLoopBase):
 
         logger.debug(f"Starting agent loop for traj_id={request_id} with use_tool={use_tool}, max_turns={max_turns}, max_response_length={max_response_length}, max_action_length={max_action_length}, max_obs_length={max_obs_length}")
         
-        # ================= [新增日志：记录初始原始 Prompt] =================       
-        # 解码初始 Prompt 文本
+        # ================= [新增日志：记录初始原始 Prompt] =================      
         initial_prompt_text = self.tokenizer.decode(running_prompt_ids, skip_special_tokens=False)
-        
         with open(log_filename, "a", encoding="utf-8") as f:
             f.write(f"\n{'#'*30} [TRAJECTORY START: {request_id}] {'#'*30}\n")
             f.write(f"🚀 [Initial Prompt]:\n")
             f.write(initial_prompt_text + "\n")
             f.write(f"{'#'*80}\n\n")
         # =================================================================
+        
+        # [修改点] 循环外的初始化：强行触发 Step 0 的环境交互 (Action 为空)
+        action_text = ""
+        do_action = True 
 
         for step in range(max_turns + 1):
-            previous_length = len(running_prompt_ids)
-            available_length = max(max_response_length - len(running_prompt_ids) + len(prompt_ids), 0)
-            max_tokens_for_this_turn = min(max_action_length, available_length)
             is_last_step = (step == max_turns)
-            if max_tokens_for_this_turn <= 0:
-                traj_stop_reason = "max_model_len_exceeded"
-                break
-            agent_sampling_params["max_tokens"] = max_tokens_for_this_turn # for vllm
-            logger.debug(f"Turn {step}: available_length={available_length}, max_tokens_for_this_turn={max_tokens_for_this_turn}")
-            # agent_sampling_params["max_new_tokens"] = max_tokens_for_this_turn # for sglang
-            with simple_timer("generate_sequences", metrics):
-                output = await self.server_manager.generate(
-                    request_id=request_id,
-                    prompt_ids=running_prompt_ids,
-                    sampling_params=agent_sampling_params,
-                    image_data=running_image_data,
-                    audio_data=running_audio_data,
-                ) # request_id here should be unique for each generate call, otherwise vllm can generate empty response
-                if output.text.strip() == "":
-                    logger.warning(f"Turn {step}: Generated empty response for traj_id={request_id}. prompt_ids length: {len(running_prompt_ids)}")
-            gen_ids = output.token_ids
-            gen_logprobs = output.log_probs or [0.0] * len(gen_ids)
-            gen_text = output.text
-
-            # ================= [新增日志：写入文件记录模型输出] =================            
-            with open(log_filename, "a", encoding="utf-8") as f:
-                f.write(f"\n{'='*20} [Step {step}] 🤖 模型生成 {'='*20}\n")
-                f.write(gen_text + "\n")
-            # =================================================================
-
-            running_prompt_ids.extend(gen_ids)
-            response_mask.extend([1] * len(gen_ids))
-            response_logprobs.extend(gen_logprobs)
+            turn_start_length = len(running_prompt_ids)
             
-            stats_dict["num_turns"] += 1
-            stats_dict["action_lengths"].append(len(gen_ids))
-            stats_dict["action_logps"].append(np.mean(gen_logprobs) if len(gen_logprobs) > 0 else 0.0)
-            if gen_text.strip() == "":
-                stats_dict["empty_responses"] += 1
-            
-            finish_reason = output.finish_reason
-            stop_reason = output.stop_reason
-            if isinstance(stop_reason, int):
-                print(f"Turn {step}: stop_reason is int: {stop_reason}")
-                stop_reason = self.tokenizer.decode([stop_reason])[0]
-            
-            if not use_tool:
-                # only one turn generation
-                stats_dict["is_traj_finished"] = True
-                traj_stop_reason = f"no_tool-{finish_reason}"
-                break
-            
-            # judge whether to interact with tool or finish
-            do_action = False
-            action_text = ""
-            if finish_reason == "stop" and stop_reason:
-                for action_stop_token in self.action_stop_tokens:
-                    if action_stop_token in stop_reason:
-                        # do action
-                        do_action = True
-                        action_text = (gen_text.split(action_stop_token)[0] + action_stop_token)
-                        break
-
-            # ================= [新增日志：写入模型输出动作指令] =================               
-            with open(log_filename, "a", encoding="utf-8") as f:
-                f.write(f"\n{'='*20} [Step {step}] 🔧 动作截取 {'='*20}\n")
-                f.write(action_text if action_text.strip() else "[警告：生成了空动作！]\n")
-            # =================================================================
-
-            # ================= [🔧 DEBUG: 硬编码 action_text 并强制触发] ================= 
-            # 覆盖前面大模型的生成结果，强制让 agent 执行测试用动作
-            do_action = True
-#             action_text = """<think>The objective is to find out who plays David's wife in "Once Upon a Time." Since the current page is a landing page and there is no content visible, I should search for "Once Upon a Time" to find the relevant article, which will likely contain cast information. I will use the search box to look for "Once Upon a Time."</think>
-# <action></action>"""
-            action_text = ""
-            
-            with open(log_filename, "a", encoding="utf-8") as f:
-                f.write(f"\n{'='*20} [Step {step}] 🐛 DEBUG: 已覆盖为硬编码动作 {'='*20}\n")
-                f.write(action_text + "\n")
-            # ===========================================================================
-
-            # send generated action to tool server
-            if do_action and not is_last_step:
+            # =====================================================================
+            # [修改点: 1. 获取环境观测 (Environment Interaction)]
+            # 放在模型生成之前，这样第一次迭代时会用空动作("")去获取初始观测并拼接到 Prompt 中
+            # =====================================================================
+            if use_tool and do_action:
                 extra_fields = kwargs.get("extra_info", {}).copy()
-                if encoded_image_data is not None:
-                    extra_fields["images"] = encoded_image_data
-                if encoded_audio_data is not None:
-                    extra_fields["audio"] = encoded_audio_data
-                logger.info(f"Turn {step}: finish_reason={finish_reason}, stop_reason={stop_reason}, do_action={do_action}, action_text={json.dumps(action_text[-50:])}")
+                logger.info(f"Turn {step}: interact with tool server. action_text={json.dumps(action_text[-50:])}")
                 start = metrics.get("tool_calls", 0.0)
+                
                 with simple_timer("tool_calls", metrics):
                     tool_results = await self.interact_with_tool_server(
                         traj_id=request_id,
                         action=action_text,
                         do_action=do_action,
                         extra_fields=extra_fields,
-                        is_last_step=is_last_step,
+                        is_last_step=False, # 依然传False，因为真正的结束判定在后面
                     )
                 end = metrics.get("tool_calls", 0.0)
                 tool_results['interact_time_ms'] = (end - start) * 1000.0
                 
-                # process observations and prepare for next turn
                 obs_text = tool_results['obs']
 
-                # ================= [新增日志：写入文件记录工具反馈] =================               
+                # ================= [新增日志：写入文件记录工具反馈] =================                
                 with open(log_filename, "a", encoding="utf-8") as f:
-                    f.write(f"\n{'='*20} [Step {step}] 🔧 工具返回 {'='*20}\n")
+                    if step == 0:
+                        f.write(f"\n{'='*20} [Step {step}] 🌍 初始环境观测 {'='*20}\n")
+                    else:
+                        f.write(f"\n{'='*20} [Step {step}] 🔧 工具返回 {'='*20}\n")
                     f.write(obs_text if obs_text.strip() else "[警告：工具返回了空内容！]\n")
                 # =================================================================
 
-
                 # =====================================================================
                 # [新增模块] 视觉上下文压缩拦截器 (Observation-Level Compression)
-                # 作用：将过长的纯文本观测渲染为图片，极大地节省 Context Window Token
                 # =====================================================================
-                
-                # 设定一个阈值，只有当工具返回的字符数大于这个值时，才进行图片渲染压缩
-                # 你可以把这个阈值配置在 self.agent_config 里
-                COMPRESSION_THRESHOLD = 500 
-                from VTC_tool.VTC_tool import VTCTool
-                vtc = VTCTool()
-                saved_dir = "/data/yutao/lzt/BrowserAgent_v2/verl-tool/logs/compressed_obs"
-                os.makedirs(saved_dir, exist_ok=True)
-                # 如果开启了压缩特性，并且当前返回的纯文本长度超标
+                COMPRESSION_THRESHOLD = 0 
                 if getattr(self.agent_config, 'enable_obs_compression', True) and len(obs_text) > COMPRESSION_THRESHOLD:
+                    saved_dir = str(project_root/f"RL/logs/verltool_agent_loop/{time_str}/obs_img")
+                    os.makedirs(saved_dir, exist_ok=True)
                     
-                    # 1. 调用渲染引擎：将冗长的 obs_text 渲染成一张 PIL.Image
-                    # （你需要实现或复用现有的 self.render_text_to_image 方法，类似于 OCR 工具的逆向过程）
-                    compressed_img, _ = vtc.render_text_to_image(obs_text)
-                    compressed_img.save(f"{saved_dir}/compressed_obs_{request_id[-6:]}.png")  # for debugging, save the compressed image
+                    loop = asyncio.get_event_loop()
                     
-                    # 2. 伪装注入：将生成的图片强行挂载到 tool_results 中，伪装成工具原生返回的图片
+                    # 1. 以较高分辨率渲染初始图像 (推荐 1024x1536 或 1024x2048)
+                    render_kwargs = {
+                        "obs_text": obs_text,
+                        "max_width": 1024,
+                        "max_height": 2048,
+                        "title": "--- SYSTEM OBSERVATION ---",
+                        "use_compact_mode": True
+                    }
+                    raw_img, _ = await loop.run_in_executor(
+                        None, 
+                        lambda: self.vtc.render_text_to_image(**render_kwargs)
+                    )
+                    
+                    # 2. 使用 Lanczos 算法进行高质量降维压缩 (在此设置压缩系数)
+                    # 例如 compression_factor=1.5 表示总面积缩小 1.5 倍
+                    COMPRESSION_FACTOR = 1.5 
+                    compressed_img_list = await loop.run_in_executor(
+                        None, 
+                        self.vtc.compress_image_arrays, 
+                        [raw_img], 
+                        COMPRESSION_FACTOR
+                    )
+                    compressed_img = compressed_img_list[0]
+                    
+                    # 3. 保存与 Base64 编码
+                    img_path = f"{saved_dir}/compressed_obs_{request_id[-6:]}_step{step}.png"
+                    await loop.run_in_executor(None, compressed_img.save, img_path)
+                    
+                    import io
+                    import base64
+                    buffered = io.BytesIO()
+                    compressed_img.save(buffered, format="PNG")
+                    img_b64_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+                    img_data_uri = f"data:image/png;base64,{img_b64_str}"
+                    
+                    # 4. 组装到 tool_results
                     if 'image' not in tool_results or tool_results['image'] is None:
                         tool_results['image'] = []
                     elif not isinstance(tool_results['image'], list):
                         tool_results['image'] = [tool_results['image']]
+                        
+                    tool_results['image'].append(img_data_uri) 
                     
-                    tool_results['image'].append(compressed_img)
-                    
-                    # 3. 文本截断与替换：用极短的提示词和视觉占位符取代原本上千 Token 的文本
-                    # 这里必须包含 "<image>"，因为你下方的原生代码会去检索并替换这个 tag
                     obs_text = f"System Observation (Compressed): <image>"
                     tool_results['obs'] = obs_text 
-                    
-                    logger.info(f"Turn {step}: Compressed long observation (length {len(tool_results['obs'])}) into an image to save tokens. Traj_id={request_id}")
-                
+                    logger.info(f"Turn {step}: Rendered high-res and compressed by {COMPRESSION_FACTOR}x. Saved to {img_path}")
                 # =====================================================================
-                # ⬆️⬆️⬆️ 拦截器结束，接下来的原生代码会完美接管 ⬆️⬆️⬆️
-
 
                 if tool_results.get('image', None):
                     images = [tool_results['image']] if not isinstance(tool_results['image'], list) else tool_results['image']
@@ -731,31 +1167,22 @@ class VerlToolAgentLoop(AgentLoopBase):
                         running_image_data = []
                         
                     running_image_data.extend(decoded_images)
-                    # add image placeholder token ids
-                    # first see whether there are <image> tags in obs_text
                     num_image_tags = obs_text.count("<image>")
                     if num_image_tags < len(decoded_images):
-                        # append at the end
                         obs_text += "<image>" * (len(decoded_images) - num_image_tags)
                         num_image_tags = len(decoded_images)
-                    # now replace <image> tags with image placeholder tokens
+                        
                     obs_text = obs_text.replace("<image>", self.qwen_image_placeholder, num_image_tags)
-                    # obs_token_ids = self.processor(text=[obs_text], images=decoded_images, return_tensors="pt")["input_ids"].squeeze(0).tolist()
 
-                    # --- 新增：安全检查 processor 是否存在 ---
                     if self.processor is not None:
-                        # 多模态模型：使用 processor 处理图文
                         obs_token_ids = self.processor(text=[obs_text], images=decoded_images, return_tensors="pt")["input_ids"].squeeze(0).tolist()
                     else:
-                        # 纯文本模型：忽略图片，直接对文本进行 tokenize
                         obs_token_ids = self.tokenizer.encode(obs_text)
-                    # --------------------------------------
 
                     if max_obs_length < len(obs_token_ids):
                         if self.agent_config.truncate_obs_side == 'left':
                             truncation_index = max_obs_length
                             if obs_token_ids[max_obs_length] in self.non_truncate_token_ids:
-                                # find the nearest non-truncate token id before max_obs_length
                                 truncation_index = max_obs_length - 1
                                 while truncation_index > 0 and obs_token_ids[truncation_index] in self.non_truncate_token_ids:
                                     truncation_index -= 1
@@ -763,29 +1190,25 @@ class VerlToolAgentLoop(AgentLoopBase):
                             obs_token_ids.extend(self.tokenizer.encode("...(truncated)"))
                         else:
                             raise NotImplementedError(f"Only left truncation is supported for multimodal observations for now.")
+                            
                 elif tool_results.get('audio', None):
                     audios = [tool_results['audio']] if not isinstance(tool_results['audio'], list) else tool_results['audio']
                     decoded_audios = [decode_image_url(audio_url) for audio_url in audios]
                     running_audio_data.extend(decoded_audios)
-                    # add audio placeholder token ids
-                    # first see whether there are <audio> tags in obs_text
                     num_audio_tags = obs_text.count("<audio>")
                     if num_audio_tags < len(decoded_audios):
-                        # append at the end
                         obs_text += "<audio>" * (len(decoded_audios) - num_audio_tags)
                         num_audio_tags = len(decoded_audios)
-                    # now replace <audio> tags with audio placeholder tokens
+                        
                     obs_text = obs_text.replace("<audio>", self.qwen_audio_placeholder, num_audio_tags)
-                    # for mtrl
                     if self.enable_mtrl:
                         obs_text = self.mtrl_sep.format(obs=obs_text)
                     obs_token_ids = self.processor(text=[obs_text], audio=decoded_audios, return_tensors="pt")["input_ids"].squeeze(0).tolist()
-                    # obs_token_ids = obs_token_ids[:max_obs_length]
+                    
                     if max_obs_length < len(obs_token_ids):
                         if self.agent_config.truncate_obs_side == 'left':
                             truncation_index = max_obs_length
                             if obs_token_ids[max_obs_length] in self.non_truncate_token_ids:
-                                # find the nearest non-truncate token id before max_obs_length
                                 truncation_index = max_obs_length - 1
                                 while truncation_index > 0 and obs_token_ids[truncation_index] in self.non_truncate_token_ids:
                                     truncation_index -= 1
@@ -810,59 +1233,105 @@ class VerlToolAgentLoop(AgentLoopBase):
                 
                 if self.enable_mtrl:
                     obs_token_ids = self.mtrl_sep_prefix_ids + obs_token_ids + self.mtrl_sep_suffix_ids
-                # update stats
+                    
                 stats_dict["obs_lengths"].append(len(obs_token_ids))
                 if 'reward' in tool_results and tool_results['reward'] is not None:
                     stats_dict["rewards"].append(tool_results['reward'] if 'reward' in tool_results else 0.0)
                 stats_dict["valid_action"] += tool_results['valid_action'] if 'valid_action' in tool_results else 0
                 stats_dict["tool_interact_info"].append(tool_results)
                 
-                # update running prompt
                 running_prompt_ids.extend(obs_token_ids)
                 if self.agent_config.mask_observations:
                     response_mask.extend([0] * len(obs_token_ids))
                 else:
                     response_mask.extend([1] * len(obs_token_ids))
-                response_logprobs.extend([0.0] * len(obs_token_ids)) # pad with 0.0 logprobs for observations
+                response_logprobs.extend([0.0] * len(obs_token_ids))
                 
-                if self.agent_config.retokenization:
-                    new_text = self.tokenizer.decode(running_prompt_ids[previous_length:], skip_special_tokens=False)
-                    new_ids = self.tokenizer.encode(new_text)
-                    if new_ids != running_prompt_ids[previous_length:]:
-                        stats_dict['retokenization_diff'].append(1)
-                        logger.debug(f"Retokenization changed the length from {len(running_prompt_ids) - previous_length} to {len(new_ids)}. traj_id={request_id}, turn={step}")
-                    else:
-                        stats_dict['retokenization_diff'].append(0)
-                    running_prompt_ids = running_prompt_ids[:previous_length] + new_ids
-                    if len(response_mask) > (len(running_prompt_ids) - len(prompt_ids)):
-                        response_mask = response_mask[:len(running_prompt_ids) - len(prompt_ids)]
-                    else:
-                        response_mask.extend([response_mask[-1]] * (len(running_prompt_ids) - len(prompt_ids) - len(response_mask)))
-                    if len(response_logprobs) > (len(running_prompt_ids) - len(prompt_ids)):
-                        response_logprobs = response_logprobs[:len(running_prompt_ids) - len(prompt_ids)]
-                    else:
-                        response_logprobs.extend([0.0] * (len(running_prompt_ids) - len(prompt_ids) - len(response_logprobs)))
-
+                # 如果环境在当前步骤就直接返回了 done（比如进入了失败死胡同或提前完成），则无需模型再继续推理
                 if tool_results['done']:
-                    # finish the trajectory
                     stats_dict["is_traj_finished"] = True
                     traj_stop_reason = "tool_signaled_done"
                     break
 
-                # ================= [🔧 DEBUG: 单步调用后强制跳出循环] ================= 
-                stats_dict["is_traj_finished"] = True
-                traj_stop_reason = "debug_single_step_break"
-                logger.info(f"🐛 DEBUG: 已完成单次 tool server 调用，正在强制跳出循环。Traj_id={request_id}")
+            # =====================================================================
+            # [修改点: 2. 模型生成 (Model Generation)]
+            # 此时 prompt_ids 已经包含了最新的环境观测，能够彻底遏制第一次推理时的幻觉问题
+            # =====================================================================
+            available_length = max(max_response_length - len(running_prompt_ids) + len(prompt_ids), 0)
+            max_tokens_for_this_turn = min(max_action_length, available_length)
+            
+            if max_tokens_for_this_turn <= 0:
+                traj_stop_reason = "max_model_len_exceeded"
+                break
                 
-                with open(log_filename, "a", encoding="utf-8") as f:
-                    f.write(f"\n{'='*20} 🐛 DEBUG: 单步跳出 {'='*20}\n")
-                    f.write("已成功阻断循环。\n")
-                break  # 强制结束当前 Agent 的交互循环，立刻进入结算阶段
-                # =========================================================================
+            agent_sampling_params["max_tokens"] = max_tokens_for_this_turn 
+            logger.debug(f"Turn {step}: available_length={available_length}, max_tokens_for_this_turn={max_tokens_for_this_turn}")
+            
+            with simple_timer("generate_sequences", metrics):
+                output = await self.server_manager.generate(
+                    request_id=request_id,
+                    prompt_ids=running_prompt_ids,
+                    sampling_params=agent_sampling_params,
+                    image_data=running_image_data,
+                    audio_data=running_audio_data,
+                )
+                if output.text.strip() == "":
+                    logger.warning(f"Turn {step}: Generated empty response for traj_id={request_id}. prompt_ids length: {len(running_prompt_ids)}")
+                    
+            gen_ids = output.token_ids
+            gen_logprobs = output.log_probs or [0.0] * len(gen_ids)
+            gen_text = output.text
 
+            # =================================================================
+            with open(log_filename, "a", encoding="utf-8") as f:
+                f.write(f"\n{'='*20} [Step {step}] 🤖 模型生成 {'='*20}\n")
+                f.write(gen_text + "\n")
+            # =================================================================
 
-            else:
-                # finish the trajectory
+            running_prompt_ids.extend(gen_ids)
+            response_mask.extend([1] * len(gen_ids))
+            response_logprobs.extend(gen_logprobs)
+            
+            stats_dict["num_turns"] += 1
+            stats_dict["action_lengths"].append(len(gen_ids))
+            stats_dict["action_logps"].append(np.mean(gen_logprobs) if len(gen_logprobs) > 0 else 0.0)
+            if gen_text.strip() == "":
+                stats_dict["empty_responses"] += 1
+            
+            finish_reason = output.finish_reason
+            stop_reason = output.stop_reason
+            if isinstance(stop_reason, int):
+                stop_reason = self.tokenizer.decode([stop_reason])[0]
+
+            # =====================================================================
+            # [修改点: 3. 动作解析 (Action Parsing)]
+            # =====================================================================
+            do_action = False
+            action_text = ""
+
+            for ext_token in self.action_extract_tokens:
+                if ext_token in gen_text:
+                    do_action = True
+                    last_idx = gen_text.rfind(ext_token)
+                    action_text = gen_text[:last_idx + len(ext_token)]
+                    break
+            
+            # =================================================================
+            with open(log_filename, "a", encoding="utf-8") as f:
+                f.write(f"\n{'='*20} [Step {step}] 🔧 动作截取 {'='*20}\n")
+                f.write(action_text if action_text.strip() else "[警告：生成了空动作！]\n")
+            # =================================================================
+
+            # =====================================================================
+            # [修改点: 4. 结束条件检查 (End Conditions Check)]
+            # 模型如果没有产出有效动作，或者达到最大轮数，则停止整个 trajectory 的推演
+            # =====================================================================
+            if not use_tool:
+                stats_dict["is_traj_finished"] = True
+                traj_stop_reason = f"no_tool-{finish_reason}"
+                break
+                
+            if not do_action or is_last_step:
                 if finish_reason == "stop":
                     if not stop_reason:
                         stats_dict["is_traj_finished"] = True
@@ -883,32 +1352,67 @@ class VerlToolAgentLoop(AgentLoopBase):
                     stats_dict["is_traj_finished"] = True
                     traj_stop_reason = f"finish_reason_{finish_reason}"
                 break
+                
+            # =====================================================================
+            # [修改点: 5. 重新分词 (Retokenization)]
+            # 放置在此处，可以刚好清理本轮由于拼接字符串导致在分词边缘处的粘连问题
+            # =====================================================================
+            if self.agent_config.retokenization:
+                new_text = self.tokenizer.decode(running_prompt_ids[turn_start_length:], skip_special_tokens=False)
+                new_ids = self.tokenizer.encode(new_text)
+                if new_ids != running_prompt_ids[turn_start_length:]:
+                    stats_dict['retokenization_diff'].append(1)
+                    logger.debug(f"Retokenization changed the length from {len(running_prompt_ids) - turn_start_length} to {len(new_ids)}. traj_id={request_id}, turn={step}")
+                else:
+                    stats_dict['retokenization_diff'].append(0)
+                running_prompt_ids = running_prompt_ids[:turn_start_length] + new_ids
+                
+                # 动态修复截断后的 mask 与 logprobs 长度对齐
+                mask_len_needed = len(running_prompt_ids) - len(prompt_ids)
+                if len(response_mask) > mask_len_needed:
+                    response_mask = response_mask[:mask_len_needed]
+                else:
+                    response_mask.extend([response_mask[-1]] * (mask_len_needed - len(response_mask)))
+                
+                if len(response_logprobs) > mask_len_needed:
+                    response_logprobs = response_logprobs[:mask_len_needed]
+                else:
+                    response_logprobs.extend([0.0] * (mask_len_needed - len(response_logprobs)))
         
+        # ==================== (后置的聚合统计和返回逻辑保持不变) ====================
         logger.debug(f"Trajectory {request_id} finished after {step} turns. Stop reason: {traj_stop_reason}")
         response_ids = running_prompt_ids[len(prompt_ids):]
         assert len(response_ids) == len(response_mask), f"Response ids and mask length mismatch: {len(response_ids)} vs {len(response_mask)}"
+        
         start = time.time()
-        # let close traj run in background but don't wait
         asyncio.create_task(self.close_traj_tool_threads(request_id=request_id))
-        # await self.close_traj_tool_threads(request_id=request_id)
         end = time.time()
         close_traj_time = end - start
         
         if self.agent_config.mask_overlong_loss and not stats_dict["is_traj_finished"]:
-            # mask the whole response
             response_mask = [0] * len(response_mask)
             stats_dict["valid_traj"] = 0
             logger.info(f"Masking the whole response for traj_id={request_id} due to overlong trajectory and not finished.")
-        
         
         if self.agent_config.mask_void_traj:
             response_text = self.tokenizer.decode(response_ids, skip_special_tokens=True).strip()
             has_answer = "\\boxed" in response_text or "final_answer(" in response_text
             if stats_dict["valid_action"] == 0 and not has_answer:
-                # mask the whole response
                 response_mask = [0] * len(response_mask)
                 stats_dict["valid_traj"] = 0
                 logger.info(f"Masking the whole response for traj_id={request_id} due to void trajectory (no valid action or no final answer). valid_action={stats_dict['valid_action']}, has_answer={has_answer}")
+
+        # 防止全 0 Mask 导致 PPO 指标计算崩溃
+        if sum(response_mask) == 0:
+            if len(response_mask) > 0:
+                # 强行保留最后一个 token 产生梯度，防止截取的 tensor 变成空的
+                response_mask[-1] = 1
+            else:
+                # 极端情况防范：如果连 response 都没生成，强行塞一个 dummy token
+                dummy_id = getattr(self.tokenizer, "eos_token_id", 151645) or 151645
+                response_ids.append(dummy_id)
+                response_mask.append(1)
+                response_logprobs.append(0.0)
             
         verl_tool_metrics = {
             "num_turns": stats_dict["num_turns"],
@@ -939,28 +1443,22 @@ class VerlToolAgentLoop(AgentLoopBase):
             "X-Process-Time_sec": sum(info.get("X-Process-Time", 0.0) for info in stats_dict["tool_interact_info"]),
             "close_traj_time": close_traj_time,
         }
-        # additional metrics in tool_interact_info can be added later
+        
         if stats_dict["tool_interact_info"] and all("metrics" in info for info in stats_dict["tool_interact_info"]):
-            # do mean aggregation for each metric key
             tool_metric_keys = stats_dict["tool_interact_info"][0]["metrics"].keys()
             for key in tool_metric_keys:
                 try:
                     verl_tool_metrics[f"tool_avg_{key}"] = np.mean([float(info["metrics"][key]) for info in stats_dict["tool_interact_info"] if key in info["metrics"]])
                 except Exception as e:
                     logger.warning(f"Failed to compute mean for tool metric {key}: {e}")
-        # additional per-turn logp
+                    
         for i, logp in enumerate(stats_dict["action_logps"]):
             verl_tool_metrics[f"turn_{i+1}_action_logp"] = logp
         
-        # Safely truncate final response so that we do not cut through multimodal placeholder tokens.
-        # Here we treat `cut_index` as "the first index to be dropped", so the last kept index is `cut_index - 1`.
         if len(response_ids) > self.response_length:
             cut_index = self.response_length
             last_keep = cut_index - 1
             if last_keep >= 0 and response_ids[last_keep] in self.non_truncate_token_ids:
-                # Step backwards over a contiguous block of placeholder tokens so that
-                # we either keep the whole block (if it is fully within the limit) or
-                # drop it entirely when it would otherwise be partially kept.
                 while last_keep >= 0 and response_ids[last_keep] in self.non_truncate_token_ids:
                     last_keep -= 1
                 cut_index = last_keep + 1
@@ -968,11 +1466,6 @@ class VerlToolAgentLoop(AgentLoopBase):
             response_mask = response_mask[:cut_index]
             response_logprobs = response_logprobs[:cut_index]
 
-        # Keep image features aligned with tokens to avoid tokens/features mismatch
-        # errors in models such as Qwen3-VL.
-        # Count only the tokens that will actually be fed to the model
-        # (prompt_ids + truncated response_ids), and approximate available image
-        # segments by counting contiguous token: <|vision_start|>
         if running_image_data is not None:
             full_ids = prompt_ids + response_ids
             vision_start_id = self.tokenizer.convert_tokens_to_ids("<|vision_start|>")

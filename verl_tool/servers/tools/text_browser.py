@@ -234,7 +234,7 @@ class TextBrowserTool(BaseTool):
             f"trajectory_id: {trajectory_id}\n"
             f"action: {action}\n"
             f"extra_field: {extra_field}\n"
-            f"observation: {obs}\n"
+            f"observation: {obs[:300]}\n"
             "%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%\n"
         )
         print(output)
