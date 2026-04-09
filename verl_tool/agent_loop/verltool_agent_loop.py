@@ -1020,6 +1020,17 @@ class VerlToolAgentLoop(AgentLoopBase):
             "valid_traj": 1,
             "retokenization_diff": []
         }
+
+        # ================= [新增模块: 初始化 Token 统计字典] =================
+        token_stats = {
+            "initial_prompt_tokens": len(prompt_ids),
+            "total_gen_tokens": 0,
+            "total_original_obs_text_tokens": 0, # 压缩前的原始纯文本 obs 长度（理论开销）
+            "total_actual_obs_tokens": 0,        # 实际喂给模型环境的总 token（实际开销）
+            "total_obs_image_tokens": 0,         # 视觉占用的 token
+            "total_obs_audio_tokens": 0          # 音频占用的 token
+        }
+        # =====================================================================
         
         if image_data or audio_data:
             raw_prompt_text = self.tokenizer.decode(prompt_ids, skip_special_tokens=False)
@@ -1030,6 +1041,8 @@ class VerlToolAgentLoop(AgentLoopBase):
                 processor_kwargs["audio"] = audio_data
             model_inputs = self.processor(**processor_kwargs)
             prompt_ids = model_inputs["input_ids"].squeeze(0).tolist()
+            # 更新经过 processor 处理后的真实 prompt 长度（包含多模态 token）
+            token_stats["initial_prompt_tokens"] = len(prompt_ids)
         
         max_turns = self.max_turns if not kwargs.get("validate", False) else self.val_max_turns
         max_response_length = self.train_max_response_length if not kwargs.get("validate", False) else self.val_max_response_length
@@ -1071,8 +1084,7 @@ class VerlToolAgentLoop(AgentLoopBase):
             turn_start_length = len(running_prompt_ids)
             
             # =====================================================================
-            # [修改点: 1. 获取环境观测 (Environment Interaction)]
-            # 放在模型生成之前，这样第一次迭代时会用空动作("")去获取初始观测并拼接到 Prompt 中
+            # [获取环境观测 (Environment Interaction)]
             # =====================================================================
             if use_tool and do_action:
                 extra_fields = kwargs.get("extra_info", {}).copy()
@@ -1085,12 +1097,18 @@ class VerlToolAgentLoop(AgentLoopBase):
                         action=action_text,
                         do_action=do_action,
                         extra_fields=extra_fields,
-                        is_last_step=False, # 依然传False，因为真正的结束判定在后面
+                        is_last_step=False, 
                     )
                 end = metrics.get("tool_calls", 0.0)
                 tool_results['interact_time_ms'] = (end - start) * 1000.0
                 
                 obs_text = tool_results['obs']
+
+                # ================= [新增模块: 截获压缩前的原始文本 Token] =================
+                # 记录未经任何压缩的原始环境反馈长度，用于后续评估压缩率
+                raw_text_len = len(self.tokenizer.encode(obs_text))
+                token_stats["total_original_obs_text_tokens"] += raw_text_len
+                # =====================================================================
 
                 # ================= [新增日志：写入文件记录工具反馈] =================                
                 with open(log_filename, "a", encoding="utf-8") as f:
@@ -1102,7 +1120,7 @@ class VerlToolAgentLoop(AgentLoopBase):
                 # =================================================================
 
                 # =====================================================================
-                # [新增模块] 视觉上下文压缩拦截器 (Observation-Level Compression)
+                # [视觉上下文压缩拦截器 (Observation-Level Compression)]
                 # =====================================================================
                 COMPRESSION_THRESHOLD = 0 
                 if getattr(self.agent_config, 'enable_obs_compression', True) and len(obs_text) > COMPRESSION_THRESHOLD:
@@ -1111,7 +1129,6 @@ class VerlToolAgentLoop(AgentLoopBase):
                     
                     loop = asyncio.get_event_loop()
                     
-                    # 1. 以较高分辨率渲染初始图像 (推荐 1024x1536 或 1024x2048)
                     render_kwargs = {
                         "obs_text": obs_text,
                         "max_width": 1024,
@@ -1124,8 +1141,6 @@ class VerlToolAgentLoop(AgentLoopBase):
                         lambda: self.vtc.render_text_to_image(**render_kwargs)
                     )
                     
-                    # 2. 使用 Lanczos 算法进行高质量降维压缩 (在此设置压缩系数)
-                    # 例如 compression_factor=1.5 表示总面积缩小 1.5 倍
                     COMPRESSION_FACTOR = 1.5 
                     compressed_img_list = await loop.run_in_executor(
                         None, 
@@ -1135,7 +1150,6 @@ class VerlToolAgentLoop(AgentLoopBase):
                     )
                     compressed_img = compressed_img_list[0]
                     
-                    # 3. 保存与 Base64 编码
                     img_path = f"{saved_dir}/compressed_obs_{request_id[-6:]}_step{step}.png"
                     await loop.run_in_executor(None, compressed_img.save, img_path)
                     
@@ -1146,7 +1160,6 @@ class VerlToolAgentLoop(AgentLoopBase):
                     img_b64_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
                     img_data_uri = f"data:image/png;base64,{img_b64_str}"
                     
-                    # 4. 组装到 tool_results
                     if 'image' not in tool_results or tool_results['image'] is None:
                         tool_results['image'] = []
                     elif not isinstance(tool_results['image'], list):
@@ -1157,7 +1170,6 @@ class VerlToolAgentLoop(AgentLoopBase):
                     obs_text = f"System Observation (Compressed): <image>"
                     tool_results['obs'] = obs_text 
                     logger.info(f"Turn {step}: Rendered high-res and compressed by {COMPRESSION_FACTOR}x. Saved to {img_path}")
-                # =====================================================================
 
                 if tool_results.get('image', None):
                     images = [tool_results['image']] if not isinstance(tool_results['image'], list) else tool_results['image']
@@ -1235,6 +1247,28 @@ class VerlToolAgentLoop(AgentLoopBase):
                     obs_token_ids = self.mtrl_sep_prefix_ids + obs_token_ids + self.mtrl_sep_suffix_ids
                     
                 stats_dict["obs_lengths"].append(len(obs_token_ids))
+
+                # ================= [新增模块: 统计环境观测 Token 花费] =================
+                actual_obs_len = len(obs_token_ids)
+                token_stats["total_actual_obs_tokens"] += actual_obs_len
+                
+                has_img = bool(tool_results.get('image', None))
+                has_aud = bool(tool_results.get('audio', None))
+                
+                if has_img or has_aud:
+                    # 此时的 tool_results['obs'] 已经是类似 "System Observation (Compressed): <image>" 的简短文本
+                    actual_text_obs = tool_results.get('obs', '')
+                    actual_text_len = len(self.tokenizer.encode(actual_text_obs))
+                    
+                    text_tokens = min(actual_text_len, actual_obs_len)
+                    mm_tokens = actual_obs_len - text_tokens
+                    
+                    if has_img:
+                        token_stats["total_obs_image_tokens"] += mm_tokens
+                    if has_aud:
+                        token_stats["total_obs_audio_tokens"] += mm_tokens
+                # =====================================================================
+
                 if 'reward' in tool_results and tool_results['reward'] is not None:
                     stats_dict["rewards"].append(tool_results['reward'] if 'reward' in tool_results else 0.0)
                 stats_dict["valid_action"] += tool_results['valid_action'] if 'valid_action' in tool_results else 0
@@ -1247,15 +1281,13 @@ class VerlToolAgentLoop(AgentLoopBase):
                     response_mask.extend([1] * len(obs_token_ids))
                 response_logprobs.extend([0.0] * len(obs_token_ids))
                 
-                # 如果环境在当前步骤就直接返回了 done（比如进入了失败死胡同或提前完成），则无需模型再继续推理
                 if tool_results['done']:
                     stats_dict["is_traj_finished"] = True
                     traj_stop_reason = "tool_signaled_done"
                     break
 
             # =====================================================================
-            # [修改点: 2. 模型生成 (Model Generation)]
-            # 此时 prompt_ids 已经包含了最新的环境观测，能够彻底遏制第一次推理时的幻觉问题
+            # [模型生成 (Model Generation)]
             # =====================================================================
             available_length = max(max_response_length - len(running_prompt_ids) + len(prompt_ids), 0)
             max_tokens_for_this_turn = min(max_action_length, available_length)
@@ -1282,6 +1314,10 @@ class VerlToolAgentLoop(AgentLoopBase):
             gen_logprobs = output.log_probs or [0.0] * len(gen_ids)
             gen_text = output.text
 
+            # ================= [新增模块: 统计模型生成 Token 花费] =================
+            token_stats["total_gen_tokens"] += len(gen_ids)
+            # =====================================================================
+
             # =================================================================
             with open(log_filename, "a", encoding="utf-8") as f:
                 f.write(f"\n{'='*20} [Step {step}] 🤖 模型生成 {'='*20}\n")
@@ -1304,7 +1340,7 @@ class VerlToolAgentLoop(AgentLoopBase):
                 stop_reason = self.tokenizer.decode([stop_reason])[0]
 
             # =====================================================================
-            # [修改点: 3. 动作解析 (Action Parsing)]
+            # [动作解析 (Action Parsing)]
             # =====================================================================
             do_action = False
             action_text = ""
@@ -1323,8 +1359,7 @@ class VerlToolAgentLoop(AgentLoopBase):
             # =================================================================
 
             # =====================================================================
-            # [修改点: 4. 结束条件检查 (End Conditions Check)]
-            # 模型如果没有产出有效动作，或者达到最大轮数，则停止整个 trajectory 的推演
+            # [结束条件检查 (End Conditions Check)]
             # =====================================================================
             if not use_tool:
                 stats_dict["is_traj_finished"] = True
@@ -1354,8 +1389,7 @@ class VerlToolAgentLoop(AgentLoopBase):
                 break
                 
             # =====================================================================
-            # [修改点: 5. 重新分词 (Retokenization)]
-            # 放置在此处，可以刚好清理本轮由于拼接字符串导致在分词边缘处的粘连问题
+            # [重新分词 (Retokenization)]
             # =====================================================================
             if self.agent_config.retokenization:
                 new_text = self.tokenizer.decode(running_prompt_ids[turn_start_length:], skip_special_tokens=False)
@@ -1367,7 +1401,6 @@ class VerlToolAgentLoop(AgentLoopBase):
                     stats_dict['retokenization_diff'].append(0)
                 running_prompt_ids = running_prompt_ids[:turn_start_length] + new_ids
                 
-                # 动态修复截断后的 mask 与 logprobs 长度对齐
                 mask_len_needed = len(running_prompt_ids) - len(prompt_ids)
                 if len(response_mask) > mask_len_needed:
                     response_mask = response_mask[:mask_len_needed]
@@ -1379,7 +1412,6 @@ class VerlToolAgentLoop(AgentLoopBase):
                 else:
                     response_logprobs.extend([0.0] * (mask_len_needed - len(response_logprobs)))
         
-        # ==================== (后置的聚合统计和返回逻辑保持不变) ====================
         logger.debug(f"Trajectory {request_id} finished after {step} turns. Stop reason: {traj_stop_reason}")
         response_ids = running_prompt_ids[len(prompt_ids):]
         assert len(response_ids) == len(response_mask), f"Response ids and mask length mismatch: {len(response_ids)} vs {len(response_mask)}"
@@ -1402,13 +1434,10 @@ class VerlToolAgentLoop(AgentLoopBase):
                 stats_dict["valid_traj"] = 0
                 logger.info(f"Masking the whole response for traj_id={request_id} due to void trajectory (no valid action or no final answer). valid_action={stats_dict['valid_action']}, has_answer={has_answer}")
 
-        # 防止全 0 Mask 导致 PPO 指标计算崩溃
         if sum(response_mask) == 0:
             if len(response_mask) > 0:
-                # 强行保留最后一个 token 产生梯度，防止截取的 tensor 变成空的
                 response_mask[-1] = 1
             else:
-                # 极端情况防范：如果连 response 都没生成，强行塞一个 dummy token
                 dummy_id = getattr(self.tokenizer, "eos_token_id", 151645) or 151645
                 response_ids.append(dummy_id)
                 response_mask.append(1)
@@ -1454,7 +1483,7 @@ class VerlToolAgentLoop(AgentLoopBase):
                     
         for i, logp in enumerate(stats_dict["action_logps"]):
             verl_tool_metrics[f"turn_{i+1}_action_logp"] = logp
-        
+            
         if len(response_ids) > self.response_length:
             cut_index = self.response_length
             last_keep = cut_index - 1
@@ -1478,6 +1507,49 @@ class VerlToolAgentLoop(AgentLoopBase):
             multi_modal_output["image"] = running_image_data
         if running_audio_data is not None:
             multi_modal_output["audio"] = running_audio_data
+
+        # ================= [新增模块: 在轨迹日志末尾输出 Token 统计] =================
+        total_actual_tokens = token_stats["initial_prompt_tokens"] + token_stats["total_actual_obs_tokens"] + token_stats["total_gen_tokens"]
+        
+        # 计算压缩收益
+        original_cost = token_stats["total_original_obs_text_tokens"]
+        actual_cost = token_stats["total_actual_obs_tokens"]
+        tokens_saved = original_cost - actual_cost
+        compression_ratio = (original_cost / actual_cost) if actual_cost > 0 else 1.0
+
+        with open(log_filename, "a", encoding="utf-8") as f:
+            f.write(f"\n{'='*25} [TRAJECTORY SUMMARY] {'='*25}\n")
+            f.write(f"🛑 Trajectory Stop Reason: {traj_stop_reason}\n\n")
+            f.write(f"📊 Token Usage Statistics:\n")
+            f.write(f"  ├─ Initial Prompt:   {token_stats['initial_prompt_tokens']:>6} tokens\n")
+            f.write(f"  ├─ Model Generation: {token_stats['total_gen_tokens']:>6} tokens\n")
+            f.write(f"  ├─ Environment Obs (Compression Impact):\n")
+            f.write(f"  │    ├─ Original Text Cost: {original_cost:>6} tokens (Without Compression)\n")
+            f.write(f"  │    ├─ Actual Model Input: {actual_cost:>6} tokens (Text Placeholder + Visual Tokens)\n")
+            f.write(f"  │    │    ├─ Visual Tokens: {token_stats['total_obs_image_tokens']:>6} tokens\n")
+            f.write(f"  │    │    └─ Audio Tokens:  {token_stats['total_obs_audio_tokens']:>6} tokens\n")
+            
+            if tokens_saved > 0:
+                f.write(f"  │    └─ 🟢 Net Tokens Saved: {tokens_saved:>6} tokens (Compression Ratio: {compression_ratio:.2f}x)\n")
+            elif tokens_saved < 0:
+                f.write(f"  │    └─ 🔴 Net Tokens Added: {abs(tokens_saved):>6} tokens (Image costs more than original text)\n")
+            else:
+                f.write(f"  │    └─ ⚪ Net Tokens Saved:      0 tokens\n")
+                
+            f.write(f"  └─ Grand Total Fed:  {total_actual_tokens:>6} tokens\n")
+            f.write(f"{'='*72}\n")
+            
+        # 同步更新 verl_tool_metrics (供 Wandb 监控大盘使用)
+        verl_tool_metrics.update({
+            "token_initial_prompt": token_stats["initial_prompt_tokens"],
+            "token_total_gen": token_stats["total_gen_tokens"],
+            "token_obs_original_text": original_cost,
+            "token_obs_actual_fed": actual_cost,
+            "token_obs_image": token_stats["total_obs_image_tokens"],
+            "token_saved_by_compression": tokens_saved,
+            "token_grand_total": total_actual_tokens,
+        })
+        # =====================================================================
 
         output = AgentLoopOutput(
             prompt_ids=prompt_ids,
