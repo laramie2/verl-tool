@@ -281,7 +281,14 @@ class AsyncToolManager:
         for tool_type, (indices, data) in tool_groups.items():
             if tool_type is None:
                 # Handle invalid actions
-                self._handle_invalid_actions(indices, observations, dones, valids)
+                await self._handle_invalid_actions(
+                    indices,
+                    trajectory_ids,
+                    extra_fields,
+                    observations,
+                    dones,
+                    valids,
+                )
                 continue
                 
             task = self._create_tool_processing_task(tool_type, data)
@@ -325,23 +332,58 @@ class AsyncToolManager:
         
         return groups
     
-    def _handle_invalid_actions(
+    async def _handle_invalid_actions(
         self, 
         indices: List[int], 
+        trajectory_ids: List[str],
+        extra_fields: List[Dict[str, Any]],
         observations: List[Any], 
         dones: List[bool], 
         valids: List[bool]
     ):
         """Handle actions that couldn't be matched to any tool"""
         usage_instructions = self.get_usage_instructions()
-        error_response = {
-            "obs": "", 
-            "invalid_reason": "No valid tool found for action",
-            "available_tools": usage_instructions
-        }
-        
+
+        text_browser_tool = self.tools.get("text_browser")
+
         for idx in indices:
-            observations[idx] = error_response
+            current_observation = None
+            if text_browser_tool is not None:
+                try:
+                    extra = extra_fields[idx].get("extra_fields", extra_fields[idx])
+                    if text_browser_tool.has_env(trajectory_ids[idx]):
+                        if (
+                            hasattr(text_browser_tool, "aget_current_observation")
+                            and inspect.iscoroutinefunction(text_browser_tool.aget_current_observation)
+                        ):
+                            current_observation = await text_browser_tool.aget_current_observation(
+                                trajectory_ids[idx], extra
+                            )
+                        elif hasattr(text_browser_tool, "get_current_observation"):
+                            current_observation = text_browser_tool.get_current_observation(
+                                trajectory_ids[idx], extra
+                            )
+                except Exception as exc:
+                    logger.debug(
+                        f"Failed to collect current observation for invalid action "
+                        f"(trajectory_id={trajectory_ids[idx]}): {exc}"
+                    )
+
+            error_message = "No valid tool found for action."
+            if current_observation:
+                obs_text = (
+                    f"{error_message} Please review the current page state and try again.\n\n"
+                    f"Current observation:\n{current_observation}"
+                )
+            else:
+                obs_text = error_message
+
+            observations[idx] = {
+                "obs": obs_text,
+                "invalid_reason": "No valid tool found for action",
+                "available_tools": usage_instructions,
+                "current_observation": current_observation,
+            }
             valids[idx] = False
             dones[idx] = self.done_if_invalid
     

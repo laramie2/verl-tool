@@ -325,18 +325,71 @@ class RayToolManager:
         Returns:
             tuple: (observations, dones, valids) for invalid actions
         """
-        futures = [
-            handle_invalid_action.remote(tid, action, extra, self.done_if_invalid)
-            for tid, action, extra in zip(trajectory_ids, actions, extra_fields)
-        ]
-        
-        results = await self._ray_get_async(futures)
-        
-        if results:
-            observations, dones, valids = zip(*results)
-            return list(observations), list(dones), list(valids)
-        else:
-            return [], [], []
+        usage_instructions = self.get_usage_instructions()
+        text_browser_tool = self.tools.get("text_browser")
+        observations = []
+        dones = []
+        valids = []
+
+        current_obs_futures = []
+        for tid, extra in zip(trajectory_ids, extra_fields):
+            if text_browser_tool is None:
+                current_obs_futures.append(None)
+                continue
+
+            try:
+                has_env = await self._ray_get_async(text_browser_tool.has_env.remote(tid))
+                if has_env:
+                    current_obs_futures.append(
+                        text_browser_tool.get_current_observation.remote(
+                            tid,
+                            extra.get("extra_fields", extra),
+                        )
+                    )
+                else:
+                    current_obs_futures.append(None)
+            except Exception as e:
+                logger.debug(
+                    f"Failed to inspect text_browser env for invalid action "
+                    f"(trajectory_id={tid}): {e}"
+                )
+                current_obs_futures.append(None)
+
+        current_obs_results = []
+        for future in current_obs_futures:
+            if future is None:
+                current_obs_results.append(None)
+                continue
+            try:
+                current_obs_results.append(await self._ray_get_async(future))
+            except Exception as e:
+                logger.debug(f"Failed to fetch current observation for invalid action: {e}")
+                current_obs_results.append(None)
+
+        for tid, action, current_obs in zip(trajectory_ids, actions, current_obs_results):
+            error_message = "No valid tool found for action."
+            if current_obs:
+                obs_text = (
+                    f"{error_message} Please review the current page state and try again.\n\n"
+                    f"Current observation:\n{current_obs}"
+                )
+            else:
+                obs_text = error_message
+
+            observations.append(
+                {
+                    "obs": obs_text,
+                    "invalid_reason": "No valid tool found for action",
+                    "action_preview": action[:100] + "..." if len(action) > 100 else action,
+                    "trajectory_id": tid,
+                    "available_tools": usage_instructions,
+                    "current_observation": current_obs,
+                }
+            )
+            dones.append(self.done_if_invalid)
+            valids.append(False)
+
+        return observations, dones, valids
     
     async def process_actions(
         self, 
