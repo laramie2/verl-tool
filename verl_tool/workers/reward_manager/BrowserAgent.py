@@ -66,19 +66,27 @@ class WikiRLRewardManager:
         # print("answer score", ground_truths, pred, score)
         return score
 
-    def format_score(self, actions):
-        # Average of format_score
-        scores = [format_score(action) for action in actions]
-        return sum(scores) / len(scores) if scores else 0
+    def format_score(self, actions, uid=None):
+        scores = []
 
-    # def __call__(self, data:DataProto):
-    #     # Retrieve the list of predicted responses.
-    #     # print("")
-    #     # print(data)
-    #     # import pickle
-    #     # with open("data_stub.pkl", "wb") as f:
-    #     #     pickle.dump(data, f)
-    #     pass
+        for j, action in enumerate(actions):
+            try:
+                s = format_score(action)
+            except Exception as e:
+                s = 0.0
+                print(f"[FORMAT_SCORE_ERROR] uid={uid} action_idx={j} err={repr(e)}")
+
+            scores.append(s)
+
+            # print("=" * 100)
+            # print(f"[FORMAT_DEBUG] uid={uid} action_idx={j} score={s}")
+            # print("[ACTION_REPR]")
+            # print(repr(action))
+            # print("[ACTION_RAW]")
+            # print(action)
+            # print("=" * 100)
+
+        return sum(scores) / len(scores) if scores else 0.0
 
     def __call__(self, data: DataProto, return_dict=False):
         """
@@ -108,8 +116,6 @@ class WikiRLRewardManager:
                 return data.batch["rm_scores"]
 
         print("💰 wikiRL Reward Manager: computing rewards for a batch...")
-        # print(data)
-        # print(len(data))
         import pickle
         with open("data_stub_new_qwq.pkl", "wb") as f:
             pickle.dump(data, f)
@@ -121,41 +127,98 @@ class WikiRLRewardManager:
 
         actions_list, observations_list, response_list = [], [], []
 
-        # ---------- 1.  decode actions / obs / responses --------------------
+        # ---------- 1. decode reward texts from responses --------------------
         for i in range(len(data)):
-            input_ids = data.batch["input_ids"][i].tolist()
-            attention_mask = data.batch["attention_mask"][i].tolist()
-            # 如果找不到，就给当前 batch 每个样本一个空列表
-            action_lens = data.non_tensor_batch.get("action_lengths", [[] for _ in range(len(data))])[i]
-            obs_lens = data.non_tensor_batch.get("obs_lengths", [[] for _ in range(len(data))])[i]
+            uid = data.non_tensor_batch.get("uid", [None] * len(data))[i]
 
-            prompt_len = 2048
-            resp_ids   = input_ids[prompt_len:]
-            resp_mask  = attention_mask[prompt_len:]
-            resp_tokens = [
-                tid for tid, m in zip(resp_ids, resp_mask)
-                if m == 1 and tid not in special_token_ids
-            ]
-            resp_text = self.tokenizer.decode(resp_tokens, skip_special_tokens=True).strip()
-            response_list.append(resp_text)
+            # 1) 直接使用 responses，而不是 input_ids[prompt_len:]
+            response_ids = data.batch["responses"][i].tolist()
 
-            cursor, actions, observations = 0, [], []
-            for a_len, o_len in zip(action_lens, obs_lens):
-                actions.append(self.tokenizer.decode(
-                    resp_tokens[cursor:cursor + a_len - 1],
-                    skip_special_tokens=True).strip())
-                cursor += a_len - 1
-                observations.append(self.tokenizer.decode(
-                    resp_tokens[cursor:cursor + o_len - 1],
-                    skip_special_tokens=True).strip())
-                cursor += o_len - 1
-            if cursor < len(resp_tokens):
-                actions.append(self.tokenizer.decode(
-                    resp_tokens[cursor:],
-                    skip_special_tokens=True).strip())
+            # 2) 保留 special tokens，方便识别 <|im_start|>assistant ... <|im_end|>
+            decoded_response_with_special = self.tokenizer.decode(
+                response_ids,
+                skip_special_tokens=False
+            )
+
+            decoded_response_no_special = self.tokenizer.decode(
+                response_ids,
+                skip_special_tokens=True
+            ).strip()
+
+            # 3) 提取所有 assistant block
+            assistant_blocks = re.findall(
+                r"<\|im_start\|>assistant\s*(.*?)(?=<\|im_end\|>)",
+                decoded_response_with_special,
+                flags=re.DOTALL
+            )
+
+            # 4) 如果最后一个 assistant 没有 <|im_end|>，补充提取尾部残段
+            if "<|im_start|>assistant" in decoded_response_with_special:
+                last_after_assistant = decoded_response_with_special.split("<|im_start|>assistant")[-1]
+                if "<|im_end|>" not in last_after_assistant:
+                    tail_block = last_after_assistant.strip()
+                    if tail_block:
+                        assistant_blocks.append(tail_block)
+
+            # 5) 清理 assistant block 里的 special tokens
+            cleaned_assistant_blocks = []
+            for block in assistant_blocks:
+                block = re.sub(r"<\|.*?\|>", "", block)
+                block = block.strip()
+                if block:
+                    cleaned_assistant_blocks.append(block)
+
+            # 6) 用于 answer_score 的完整轨迹文本：所有 assistant 输出拼接
+            if cleaned_assistant_blocks:
+                reward_text = "\n\n".join(cleaned_assistant_blocks)
+            else:
+                # fallback：如果没匹配到 assistant block，就用 skip_special_tokens 后的 responses
+                reward_text = decoded_response_no_special
+
+            response_list.append(reward_text)
+
+            # 7) 用于 format_score 的输入：
+            #    不改奖励计算逻辑，仍然把 actions_list[i] 传给 self.format_score()
+            #    这里把每个 assistant block 作为一个 action 评分单元
+            actions = cleaned_assistant_blocks if cleaned_assistant_blocks else [reward_text]
+            observations = []
 
             actions_list.append(actions)
             observations_list.append(observations)
+
+            # 8) 记录一条轨迹所有用于奖励计算的文本
+            try:
+                format_reward_text = "\n\n".join(
+                    f"===== ACTION {j} =====\n{a}"
+                    for j, a in enumerate(actions)
+                )
+
+                debug_entry = {
+                    "uid": str(uid),
+                    "sample_idx": i,
+                    "num_actions": len(actions),
+
+                    # 最关键：实际用于 format_reward 的所有文本
+                    "format_reward_text": format_reward_text,
+                    "format_reward_actions": actions,
+                    "format_reward_actions_repr": [repr(a) for a in actions],
+
+                    # 实际用于 answer_score 的文本
+                    "reward_text": reward_text,
+                    "reward_text_repr": repr(reward_text),
+
+                    # 原始 responses 解码，方便排查
+                    # "decoded_response_with_special": decoded_response_with_special,
+                    # "decoded_response_with_special_repr": repr(decoded_response_with_special),
+                    # "decoded_response_no_special": decoded_response_no_special,
+                    # "decoded_response_no_special_repr": repr(decoded_response_no_special),
+                }
+
+                with Path("format_reward_input_debug.jsonl").open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(debug_entry, ensure_ascii=False) + "\n")
+
+            except Exception as e:
+                print(f"[WARN] could not write format_reward_input_debug.jsonl: {e}")
 
         # ---------- 2.  reward tensor --------------------------------------
         prompt_ids   = data.batch["prompts"]
@@ -170,8 +233,12 @@ class WikiRLRewardManager:
             gts = data.non_tensor_batch["reward_model"][i]["ground_truth"]
             pred = response_list[i]
             answer_reward  = self.answer_score(pred, gts)
-            format_reward  = self.format_score(actions_list[i])
-            final_reward   = answer_reward + 0.5 * format_reward
+            uid = data.non_tensor_batch.get("uid", [None] * len(data))[i]
+            format_reward = self.format_score(actions_list[i], uid=uid)
+            final_reward = (
+                self.fuzzy_weight * answer_reward +
+                self.structure_weight * format_reward
+            )
 
             # reward_tensor[i, valid_resp_len[i].item() - 1] = final_reward
             # 将 final_reward 填入 sequence 的最后一个有效位置
@@ -183,7 +250,7 @@ class WikiRLRewardManager:
 
         # ---------- 3.  persistent logging ---------------------------------
         try:
-            log_file = Path("reward_manager_history.jsonl")
+            log_file = Path("/DATA/disk0/yjb/yutao/lzt/BrowserAgent_v2/RL/logs/reward_manager_history.jsonl")
             log_file.parent.mkdir(parents=True, exist_ok=True)
             with log_file.open("a", encoding="utf-8") as f:
                 for idx in range(len(data)):
@@ -198,9 +265,22 @@ class WikiRLRewardManager:
                     log_entry = {
                         "uid": data.non_tensor_batch.get("uid", [None]*len(data))[idx],
                         "input_tokens": input_tokens,
-                        "pred_tokens":  pred_tokens,
+                        "pred_tokens": pred_tokens,
+
+                        # 原有字段
                         "actions": actions_list[idx],
                         "observations": observations_list[idx],
+
+                        # ==================== 新增：实际传入 format_score 的全部文本 ====================
+                        "format_reward_text": "\n\n".join(
+                            f"===== ACTION {j} =====\n{a}"
+                            for j, a in enumerate(actions_list[idx])
+                        ),
+                        "format_reward_actions_repr": [
+                            repr(a) for a in actions_list[idx]
+                        ],
+                        # =====================================================================
+
                         "answer_score": answer_scores[idx],
                         "format_score": format_scores[idx],
                     }

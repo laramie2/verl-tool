@@ -38,11 +38,11 @@ class FinishTool(BaseTool):
                 logger.debug(f"FinishTool: Deleting env for tool {tool_type} and trajectory_id={trajectory_id}, has_env={ray.get(tool.has_env.remote(trajectory_id))}, env_cache_keys={ray.get(tool.get_env_cache_keys.remote())}")
                 has_env = ray.get(tool.has_env.remote(trajectory_id))
                 if has_env:
-                    ray.get(tool.delete_env.remote(trajectory_id))
+                    ray.get(tool.delete_env.remote(trajectory_id, discard_actor=True))
             else:
                 logger.debug(f"FinishTool: Deleting env for tool {tool_type} and trajectory_id={trajectory_id}, has_env={tool.has_env(trajectory_id)}, env_cache_keys={list(tool.env_cache.keys())}")
                 if tool.has_env(trajectory_id):
-                    tool.delete_env(trajectory_id)
+                    tool.delete_env(trajectory_id, discard_actor=True)
         
         return observation, done, is_valid
     

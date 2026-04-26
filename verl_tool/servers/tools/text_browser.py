@@ -44,7 +44,8 @@ INIT_RETRIES = max(1, int(os.getenv("TEXT_BROWSER_INIT_RETRIES", "1")))
 STEP_RETRIES = max(1, int(os.getenv("TEXT_BROWSER_STEP_RETRIES", "2")))
 INIT_RETRY_BACKOFF_SEC = float(os.getenv("TEXT_BROWSER_INIT_RETRY_BACKOFF_SEC", "1.0"))
 STEP_RETRY_BACKOFF_SEC = float(os.getenv("TEXT_BROWSER_STEP_RETRY_BACKOFF_SEC", "0.5"))
-ENV_PROCESS_RPC_TIMEOUT_SEC = float(os.getenv("TEXT_BROWSER_ENV_RPC_TIMEOUT_SEC", "300.0"))
+ENV_PROCESS_RPC_TIMEOUT_SEC = float(os.getenv("TEXT_BROWSER_ENV_RPC_TIMEOUT_SEC", "70.0"))
+ACTION_TIMEOUT_SEC = float(os.getenv("TEXT_BROWSER_ACTION_TIMEOUT_SEC", "75.0"))
 ENV_PROCESS_SHUTDOWN_TIMEOUT_SEC = float(
     os.getenv("TEXT_BROWSER_ENV_SHUTDOWN_TIMEOUT_SEC", "10.0")
 )
@@ -456,9 +457,12 @@ class TextBrowserTool(BaseTool):
                 self.actor_creation_order.remove(trajectory_id)
             return actor
 
-    def delete_env(self, trajectory_id, reset_actor=False):
+    def delete_env(self, trajectory_id, reset_actor=False, discard_actor=False):
         actor = self._pop_actor(trajectory_id)
         if actor is None:
+            return
+        if discard_actor:
+            self._discard_actor(actor)
             return
         release_actor = True
         if reset_actor:
@@ -472,9 +476,12 @@ class TextBrowserTool(BaseTool):
         else:
             self._discard_actor(actor)
 
-    async def adelete_env(self, trajectory_id, reset_actor=False):
+    async def adelete_env(self, trajectory_id, reset_actor=False, discard_actor=False):
         actor = self._pop_actor(trajectory_id)
         if actor is None:
+            return
+        if discard_actor:
+            self._discard_actor(actor)
             return
         release_actor = True
         if reset_actor:
@@ -521,7 +528,7 @@ class TextBrowserTool(BaseTool):
         question, gt, url = self._extract_request_context(extra_field)
         return await asyncio.wait_for(
             actor.execute.remote(action, question, gt, url),
-            timeout=300,
+            timeout=ACTION_TIMEOUT_SEC,
         )
 
     def get_current_observation(self, trajectory_id: str, extra_field: dict):
@@ -561,7 +568,7 @@ class TextBrowserTool(BaseTool):
         try:
             obs, done, valid = self._run_actor(actor, action, extra_field)
         except Exception as exc:
-            self.delete_env(trajectory_id, reset_actor=True)
+            self.delete_env(trajectory_id, discard_actor=True)
             return f"Error: {exc}", False, False
 
         self._touch_actor(trajectory_id)
@@ -588,10 +595,10 @@ class TextBrowserTool(BaseTool):
         try:
             obs, done, valid = await self._arun_actor(actor, action, extra_field)
         except asyncio.TimeoutError:
-            await self.adelete_env(trajectory_id, reset_actor=True)
+            await self.adelete_env(trajectory_id, discard_actor=True)
             return "[TIMEOUT] (aconduct_action)", True, False
         except Exception as exc:
-            await self.adelete_env(trajectory_id, reset_actor=True)
+            await self.adelete_env(trajectory_id, discard_actor=True)
             return f"Error: {exc}", False, False
 
         self._touch_actor(trajectory_id)

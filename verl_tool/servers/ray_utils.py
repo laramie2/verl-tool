@@ -81,7 +81,9 @@ class RayToolManager:
             try:
                 tool_cls = get_tool_cls(tool_type)
 
-                tool_instance = ray.remote(max_concurrency=self.config.workers_per_tool)(tool_cls).remote()
+                tool_instance = ray.remote(max_concurrency=self.config.workers_per_tool)(tool_cls).remote(
+                    num_workers=self.config.workers_per_tool
+                )
                 self.tools[tool_type] = tool_instance
                 initialized_tools.append(tool_type)
                 logger.info(f"✓ Initialized Ray tool: {tool_type}")
