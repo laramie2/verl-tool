@@ -16,6 +16,8 @@ from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, ValidationInfo
 import concurrent.futures
+from collections import deque
+import statistics
 
 from .utils import hash_requests
 from .tools import get_tool_cls, ALL_TOOLS, set_use_tqdm
@@ -499,9 +501,105 @@ class AsyncToolServer:
         
         self._setup_routes()
         self._setup_middleware()
+
+        # ==================== 新增：吞吐量统计 ====================
+        self.active_requests = 0
+        self.timeout_requests = 0
+        self.error_requests = 0
+
+        self.metric_window_sec = 60
+        self.metric_events = deque(maxlen=10000)
+        # 每个元素: {
+        #   "ts": float,
+        #   "num_actions": int,
+        #   "latency_ms": float,
+        #   "queue_ms": float,
+        #   "success": bool,
+        # }
+
+        self.last_metric_log_time = 0
+        self.metric_log_interval_sec = 10
+        # =========================================================
         
     
-    
+    # ==================== 新增：记录单次请求指标 ====================
+    def _record_tool_metric(
+        self,
+        *,
+        num_actions: int,
+        latency_ms: float,
+        queue_ms: float,
+        success: bool,
+    ):
+        now = time.time()
+
+        self.metric_events.append({
+            "ts": now,
+            "num_actions": num_actions,
+            "latency_ms": latency_ms,
+            "queue_ms": queue_ms,
+            "success": success,
+        })
+
+        # 清理窗口外数据
+        cutoff = now - self.metric_window_sec
+        while self.metric_events and self.metric_events[0]["ts"] < cutoff:
+            self.metric_events.popleft()
+
+
+    def _maybe_log_tool_metrics(self):
+        now = time.time()
+        if now - self.last_metric_log_time < self.metric_log_interval_sec:
+            return
+
+        self.last_metric_log_time = now
+
+        events = list(self.metric_events)
+        if not events:
+            return
+
+        window_sec = max(1e-6, min(self.metric_window_sec, now - events[0]["ts"]))
+
+        total_reqs = len(events)
+        total_actions = sum(e["num_actions"] for e in events)
+        success_reqs = sum(1 for e in events if e["success"])
+        failed_reqs = total_reqs - success_reqs
+
+        latencies = [e["latency_ms"] for e in events]
+        queues = [e["queue_ms"] for e in events]
+
+        avg_latency = sum(latencies) / len(latencies)
+        max_latency = max(latencies)
+
+        if len(latencies) >= 20:
+            p95_latency = statistics.quantiles(latencies, n=20)[-1]
+        else:
+            p95_latency = max_latency
+
+        avg_queue = sum(queues) / len(queues)
+        max_queue = max(queues)
+
+        logger.info(
+            "[TOOL_SERVER_METRIC] "
+            f"window={window_sec:.1f}s "
+            f"active={self.active_requests} "
+            f"req_qps={total_reqs / window_sec:.2f} "
+            f"action_qps={total_actions / window_sec:.2f} "
+            f"total_reqs={total_reqs} "
+            f"total_actions={total_actions} "
+            f"success_reqs={success_reqs} "
+            f"failed_reqs={failed_reqs} "
+            f"timeout_total={self.timeout_requests} "
+            f"error_total={self.error_requests} "
+            f"avg_latency_ms={avg_latency:.1f} "
+            f"p95_latency_ms={p95_latency:.1f} "
+            f"max_latency_ms={max_latency:.1f} "
+            f"avg_queue_ms={avg_queue:.1f} "
+            f"max_queue_ms={max_queue:.1f}"
+        )
+    # =========================================================
+
+
     @asynccontextmanager
     async def _lifespan(self, app: FastAPI):
         """
@@ -582,108 +680,184 @@ class AsyncToolServer:
         async def process_observations(
             request: Request,
             request_data: ActionRequest,
-            semaphore_wait_time: float = Depends(get_semaphore)  # Get actual wait time
+            semaphore_wait_time: float = Depends(get_semaphore)
         ):
-            
-            logger.info(f"🚨🚨🚨 [DEBUG] 收到请求啦！")
-            logger.info(f"👉 trajectory_ids: {request_data.trajectory_ids}")
-            logger.info(f"👉 actions: {request_data.actions}")
-            logger.info(f"👉 extra_fields: {request_data.extra_fields}")
-
-            """Main endpoint for processing observations"""
             start_time = time.time()
             request_start_time = getattr(request.state, "start_time", start_time)
             queue_time_ms = (start_time - request_start_time) * 1000
-            
-            # Log request body size
-            try:
-                body = await request.body()
-                body_size_mb = len(body) / (1024 * 1024)
-                if body_size_mb > 1.0:
-                    logger.warning(f"Large request body: {body_size_mb:.2f} MB")
-            except Exception:
-                pass
 
-            self.total_requests += 1
-            self.total_unique_request_ids.update(request_data.trajectory_ids)
-            # add if finish is set, track finished ids
-            if request_data.finish:
-                for traj_id, fin in zip(request_data.trajectory_ids, request_data.finish):
-                    if fin:
-                        self.total_unique_finish_ids.add(traj_id)
-            
+            num_actions = len(request_data.actions) if request_data.actions else 0
+
+            # ==================== 新增：进入请求，当前并发 +1 ====================
+            self.active_requests += 1
+            # ================================================================
+
             try:
-                # Process extra fields
-                extra_fields = self._prepare_extra_fields(request_data)
-                
-                # Check for duplicate processing
-                if self.config.enable_hashing:
-                    cache_key = hash_requests(request_data.model_dump())
-                    cached_result = self.processing_cache.get(cache_key)
-                    if cached_result:
-                        logger.debug(f"Returning cached result for request")
-                        return cached_result
-                # logger.debug(f"received request: trajectory_ids={request_data.trajectory_ids}, actions={[x[-50:] for x in request_data.actions]}, extra_fields={extra_fields}")
-                
-                # Process actions with timeout
+                logger.info(f"🚨🚨🚨 [DEBUG] 收到请求啦！")
+                logger.info(f"👉 trajectory_ids: {request_data.trajectory_ids}")
+                logger.info(f"👉 actions: {request_data.actions}")
+                logger.info(f"👉 extra_fields: {request_data.extra_fields}")
+
                 try:
-                    observations, dones, valids = await asyncio.wait_for(
-                        self.tool_manager.process_actions(
-                            request_data.trajectory_ids,
-                            request_data.actions,
-                            extra_fields
-                        ),
-                        timeout=self.config.request_timeout
+                    body = await request.body()
+                    body_size_mb = len(body) / (1024 * 1024)
+                    if body_size_mb > 1.0:
+                        logger.warning(f"Large request body: {body_size_mb:.2f} MB")
+                except Exception:
+                    pass
+
+                self.total_requests += 1
+                self.total_unique_request_ids.update(request_data.trajectory_ids)
+
+                if request_data.finish:
+                    for traj_id, fin in zip(request_data.trajectory_ids, request_data.finish):
+                        if fin:
+                            self.total_unique_finish_ids.add(traj_id)
+
+                try:
+                    extra_fields = self._prepare_extra_fields(request_data)
+
+                    if self.config.enable_hashing:
+                        cache_key = hash_requests(request_data.model_dump())
+                        cached_result = self.processing_cache.get(cache_key)
+                        if cached_result:
+                            processing_time_ms = (time.time() - start_time) * 1000
+
+                            # ==================== 新增：cache hit 也计入成功吞吐 ====================
+                            self._record_tool_metric(
+                                num_actions=num_actions,
+                                latency_ms=processing_time_ms,
+                                queue_ms=queue_time_ms,
+                                success=True,
+                            )
+                            self._maybe_log_tool_metrics()
+                            # ===============================================================
+
+                            logger.debug("Returning cached result for request")
+                            return cached_result
+
+                    try:
+                        observations, dones, valids = await asyncio.wait_for(
+                            self.tool_manager.process_actions(
+                                request_data.trajectory_ids,
+                                request_data.actions,
+                                extra_fields
+                            ),
+                            timeout=self.config.request_timeout
+                        )
+
+                        logger.info("✅✅✅ [DEBUG] Action 处理完毕，获取到后端返回结果！")
+                        logger.info(f"🎯 trajectory_ids: {request_data.trajectory_ids}")
+                        logger.info(f"🎯 Dones状态: {dones}")
+                        logger.info(f"🎯 Valids状态: {valids}")
+
+                        if observations:
+                            truncated_obs = [
+                                (str(obs)[:300] + "...(已截断)") if len(str(obs)) > 300 else str(obs)
+                                for obs in observations
+                            ]
+                            logger.info(f"🎯 Observations (共 {len(observations)} 条): {truncated_obs}")
+                        else:
+                            logger.info("🎯 Observations 为空！")
+
+                    except asyncio.TimeoutError as e:
+                        self.timeout_requests += 1
+                        processing_time_ms = (time.time() - start_time) * 1000
+
+                        # ==================== 新增：记录 timeout ====================
+                        self._record_tool_metric(
+                            num_actions=num_actions,
+                            latency_ms=processing_time_ms,
+                            queue_ms=queue_time_ms,
+                            success=False,
+                        )
+                        self._maybe_log_tool_metrics()
+                        # ===========================================================
+
+                        logger.error(f"Action processing timeout after {processing_time_ms:.1f} ms", exc_info=True)
+                        raise HTTPException(status_code=500, detail=f"Action processing timeout: {str(e)}")
+
+                    except Exception as e:
+                        self.error_requests += 1
+                        processing_time_ms = (time.time() - start_time) * 1000
+
+                        # ==================== 新增：记录普通错误 ====================
+                        self._record_tool_metric(
+                            num_actions=num_actions,
+                            latency_ms=processing_time_ms,
+                            queue_ms=queue_time_ms,
+                            success=False,
+                        )
+                        self._maybe_log_tool_metrics()
+                        # ===========================================================
+
+                        logger.error(f"Error during action processing: {e}", exc_info=True)
+                        raise HTTPException(status_code=500, detail=f"Action processing failed: {str(e)}")
+
+                    processing_time_ms = (time.time() - start_time) * 1000
+
+                    response = AgentResponse(
+                        observations=observations,
+                        dones=dones,
+                        valids=valids,
+                        processing_time_ms=processing_time_ms,
+                        queue_time_ms=queue_time_ms
                     )
 
-                    # =========================================================
-                    # 🚀 新增的日志打印代码：将后端返回的真实结果输出到日志文件中
-                    # =========================================================
-                    logger.info("✅✅✅ [DEBUG] Action 处理完毕，获取到后端返回结果！")
-                    logger.info(f"🎯 trajectory_ids: {request_data.trajectory_ids}")
-                    logger.info(f"🎯 Dones状态: {dones}")
-                    logger.info(f"🎯 Valids状态: {valids}")
-                    
-                    # 防止 observations 太长刷屏，打印数量并截断每个结果的前 300 个字符
-                    if observations:
-                        truncated_obs = [
-                            (str(obs)[:300] + "...(已截断)") if len(str(obs)) > 300 else str(obs) 
-                            for obs in observations
-                        ]
-                        logger.info(f"🎯 Observations (共 {len(observations)} 条): {truncated_obs}")
-                    else:
-                        logger.info("🎯 Observations 为空！")
-                    # =========================================================
+                    if self.config.enable_hashing:
+                        self.processing_cache[cache_key] = response
+
+                    self.finished_requests += 1
+                    self.total_processing_time_ms += processing_time_ms
+
+                    if processing_time_ms > self.max_processing_time_per_request_ms:
+                        self.max_processing_time_per_request_ms = processing_time_ms
+
+                    # ==================== 新增：记录成功请求吞吐 ====================
+                    self._record_tool_metric(
+                        num_actions=num_actions,
+                        latency_ms=processing_time_ms,
+                        queue_ms=queue_time_ms,
+                        success=True,
+                    )
+                    self._maybe_log_tool_metrics()
+                    # ===============================================================
+
+                    return response
+
+                except asyncio.TimeoutError:
+                    self.timeout_requests += 1
+                    processing_time_ms = (time.time() - start_time) * 1000
+
+                    self._record_tool_metric(
+                        num_actions=num_actions,
+                        latency_ms=processing_time_ms,
+                        queue_ms=queue_time_ms,
+                        success=False,
+                    )
+                    self._maybe_log_tool_metrics()
+
+                    raise HTTPException(status_code=408, detail="Request processing timeout")
 
                 except Exception as e:
-                    logger.error(f"Error during action processing: {e}", exc_info=True)
-                    raise HTTPException(status_code=500, detail=f"Action processing failed: {str(e)}")
-                
-                processing_time_ms = (time.time() - start_time) * 1000
-                response = AgentResponse(
-                    observations=observations,
-                    dones=dones,
-                    valids=valids,
-                    processing_time_ms=processing_time_ms,
-                    queue_time_ms=queue_time_ms
-                )
-                
-                # Cache successful responses
-                if self.config.enable_hashing:
-                    self.processing_cache[cache_key] = response
-                    
-                self.finished_requests += 1
-                self.total_processing_time_ms += processing_time_ms
-                if processing_time_ms > self.max_processing_time_per_request_ms:
-                    self.max_processing_time_per_request_ms = processing_time_ms
-                
-                return response
-                
-            except asyncio.TimeoutError:
-                raise HTTPException(status_code=408, detail="Request processing timeout")
-            except Exception as e:
-                logger.error(f"Request processing failed: {e}", exc_info=True)
-                raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
+                    self.error_requests += 1
+                    processing_time_ms = (time.time() - start_time) * 1000
+
+                    self._record_tool_metric(
+                        num_actions=num_actions,
+                        latency_ms=processing_time_ms,
+                        queue_ms=queue_time_ms,
+                        success=False,
+                    )
+                    self._maybe_log_tool_metrics()
+
+                    logger.error(f"Request processing failed: {e}", exc_info=True)
+                    raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
+
+            finally:
+                # ==================== 新增：请求结束，当前并发 -1 ====================
+                self.active_requests -= 1
+                # ================================================================
         
         @self.app.get("/health", response_model=HealthResponse)
         async def health_check():

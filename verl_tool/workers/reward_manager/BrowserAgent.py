@@ -117,8 +117,8 @@ class WikiRLRewardManager:
 
         print("💰 wikiRL Reward Manager: computing rewards for a batch...")
         import pickle
-        with open("data_stub_new_qwq.pkl", "wb") as f:
-            pickle.dump(data, f)
+        # with open("data_stub_new_qwq.pkl", "wb") as f:
+        #     pickle.dump(data, f)
 
         import json
         from pathlib import Path
@@ -214,8 +214,8 @@ class WikiRLRewardManager:
                     # "decoded_response_no_special_repr": repr(decoded_response_no_special),
                 }
 
-                with Path("format_reward_input_debug.jsonl").open("a", encoding="utf-8") as f:
-                    f.write(json.dumps(debug_entry, ensure_ascii=False) + "\n")
+                # with Path("format_reward_input_debug.jsonl").open("a", encoding="utf-8") as f:
+                #     f.write(json.dumps(debug_entry, ensure_ascii=False) + "\n")
 
             except Exception as e:
                 print(f"[WARN] could not write format_reward_input_debug.jsonl: {e}")
@@ -249,44 +249,44 @@ class WikiRLRewardManager:
             format_scores.append(format_reward)
 
         # ---------- 3.  persistent logging ---------------------------------
-        try:
-            log_file = Path("/DATA/disk0/yjb/yutao/lzt/BrowserAgent_v2/RL/logs/reward_manager_history.jsonl")
-            log_file.parent.mkdir(parents=True, exist_ok=True)
-            with log_file.open("a", encoding="utf-8") as f:
-                for idx in range(len(data)):
-                    # convert entire sequence and prediction to whitespace‑joined tokens
-                    input_text = clean_text(self.tokenizer.decode(
-                        data.batch["input_ids"][idx].tolist(),
-                        skip_special_tokens=True
-                    ).strip())
-                    input_tokens = " ".join(self.tokenizer.tokenize(input_text))
-                    pred_tokens = " ".join(self.tokenizer.tokenize(clean_text(response_list[idx])))
+        # try:
+        #     log_file = Path("/DATA/disk0/yjb/yutao/lzt/BrowserAgent_v2/RL/logs/reward_manager_history.jsonl")
+        #     log_file.parent.mkdir(parents=True, exist_ok=True)
+        #     with log_file.open("a", encoding="utf-8") as f:
+        #         for idx in range(len(data)):
+        #             # convert entire sequence and prediction to whitespace‑joined tokens
+        #             input_text = clean_text(self.tokenizer.decode(
+        #                 data.batch["input_ids"][idx].tolist(),
+        #                 skip_special_tokens=True
+        #             ).strip())
+        #             input_tokens = " ".join(self.tokenizer.tokenize(input_text))
+        #             pred_tokens = " ".join(self.tokenizer.tokenize(clean_text(response_list[idx])))
 
-                    log_entry = {
-                        "uid": data.non_tensor_batch.get("uid", [None]*len(data))[idx],
-                        "input_tokens": input_tokens,
-                        "pred_tokens": pred_tokens,
+        #             log_entry = {
+        #                 "uid": data.non_tensor_batch.get("uid", [None]*len(data))[idx],
+        #                 "input_tokens": input_tokens,
+        #                 "pred_tokens": pred_tokens,
 
-                        # 原有字段
-                        "actions": actions_list[idx],
-                        "observations": observations_list[idx],
+        #                 # 原有字段
+        #                 "actions": actions_list[idx],
+        #                 "observations": observations_list[idx],
 
-                        # ==================== 新增：实际传入 format_score 的全部文本 ====================
-                        "format_reward_text": "\n\n".join(
-                            f"===== ACTION {j} =====\n{a}"
-                            for j, a in enumerate(actions_list[idx])
-                        ),
-                        "format_reward_actions_repr": [
-                            repr(a) for a in actions_list[idx]
-                        ],
-                        # =====================================================================
+        #                 # ==================== 新增：实际传入 format_score 的全部文本 ====================
+        #                 "format_reward_text": "\n\n".join(
+        #                     f"===== ACTION {j} =====\n{a}"
+        #                     for j, a in enumerate(actions_list[idx])
+        #                 ),
+        #                 "format_reward_actions_repr": [
+        #                     repr(a) for a in actions_list[idx]
+        #                 ],
+        #                 # =====================================================================
 
-                        "answer_score": answer_scores[idx],
-                        "format_score": format_scores[idx],
-                    }
-                    f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
-        except Exception as e:
-            print(f"[WARN] could not append to reward_manager_history.jsonl: {e}")
+        #                 "answer_score": answer_scores[idx],
+        #                 "format_score": format_scores[idx],
+        #             }
+        #             f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+        # except Exception as e:
+        #     print(f"[WARN] could not append to reward_manager_history.jsonl: {e}")
 
         print(f"Computed rewards for {len(data)} samples.")
         print("Answer scores:", answer_scores)
