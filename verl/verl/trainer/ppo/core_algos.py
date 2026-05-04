@@ -827,6 +827,13 @@ def _compute_turn_reward_from_tool_info(tool_interact_info: list[dict]) -> float
         if info is None or not info.get("valid_action", False):
             continue
         total_valid += 1
+        if "obs_is_error" in info or "obs_nonempty" in info:
+            is_error = bool(info.get("obs_is_error", False))
+            obs_nonempty = bool(info.get("obs_nonempty", False))
+            if not is_error and obs_nonempty:
+                successful += 1
+            continue
+
         obs = info.get("obs", "")
         if isinstance(obs, str):
             is_error = "Error:" in obs or "Traceback" in obs or "exception" in obs.lower()
@@ -858,6 +865,8 @@ def _find_result_segment(tool_interact_info: Optional[list[dict]], result_tag: s
     for idx, info in enumerate(tool_interact_info):
         if info is None:
             continue
+        if info.get("obs_has_result_or_output", False):
+            return 2 * idx + 1
         obs = info.get("obs", "")
         if isinstance(obs, str) and (result_tag in obs or "<output>" in obs):
             # segment index = 2 * idx + 1

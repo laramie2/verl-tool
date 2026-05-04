@@ -472,7 +472,10 @@ class AgentLoopWorker:
             index = np.arange(len(batch))
 
         trajectory_info = await get_trajectory_info(
-            batch.meta_info.get("global_steps", -1), index.tolist(), batch.meta_info.get("validate", False)
+            batch.meta_info.get("global_steps", -1),
+            index.tolist(),
+            batch.meta_info.get("validate", False),
+            batch.meta_info.get("epoch", None),
         )
         
         if self.config.actor_rollout_ref.agent.max_concurrent_trajectories is not None:
@@ -528,7 +531,14 @@ class AgentLoopWorker:
                 processor=self.processor,
             )
             kwargs["validate"] = trajectory["validate"]
-            output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
+            run_kwargs = {
+                **kwargs,
+                "_rollout_global_step": trajectory["step"],
+                "_rollout_epoch": trajectory.get("epoch"),
+                "_rollout_sample_index": trajectory["sample_index"],
+                "_rollout_n": trajectory["rollout_n"],
+            }
+            output: AgentLoopOutput = await agent_loop.run(sampling_params, **run_kwargs)
 
             # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
 
@@ -668,15 +678,25 @@ class AgentLoopWorker:
                     **{k: np.array([v]) for k, v in kwargs.items()},
                     "__num_turns__": np.array([output.num_turns]),
                 }
-                extra_fields = {}
-                for key, val in output.extra_fields.items():
-                    extra_fields[key] = np.array([val], dtype=object)
 
-                non_tensor_batch.update(extra_fields)
+                # Some reward managers only need the original sample metadata plus
+                # model outputs. Passing large trajectory-side debug payloads
+                # (for example tool_interact_info with long observations) can
+                # dramatically increase Ray object-store / heap pressure when many
+                # agent trajectories score rewards concurrently.
+                if self.config.actor_rollout_ref.agent.get("pass_extra_fields_to_reward", True):
+                    extra_fields = {}
+                    for key, val in output.extra_fields.items():
+                        extra_fields[key] = np.array([val], dtype=object)
+                    non_tensor_batch.update(extra_fields)
                 data = DataProto(
                     batch=batch,
                     non_tensor_batch=non_tensor_batch,
-                    meta_info={"global_steps": trajectory["step"], "validate": trajectory["validate"]},
+                    meta_info={
+                        "global_steps": trajectory["step"],
+                        "epoch": trajectory.get("epoch"),
+                        "validate": trajectory["validate"],
+                    },
                 )
                 result = await self.reward_manager_worker.compute_score.remote(data)
                 output.reward_score = result["reward_score"]
@@ -766,7 +786,7 @@ class AgentLoopWorker:
         )
 
 
-async def get_trajectory_info(step, index, validate):
+async def get_trajectory_info(step, index, validate, epoch=None):
     """Get trajectory info.
 
     Args:
@@ -784,7 +804,14 @@ async def get_trajectory_info(step, index, validate):
             rollout_n += 1
         else:
             rollout_n = 0
-        trajectory_info.append({"step": step, "sample_index": index[i], "rollout_n": rollout_n, "validate": validate})
+        trajectory_info.append({
+                "step": step,
+                "epoch": epoch,
+                "sample_index": index[i],
+                "rollout_n": rollout_n,
+                "validate": validate,
+            }
+        )
     return trajectory_info
 
 

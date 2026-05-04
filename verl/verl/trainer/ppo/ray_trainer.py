@@ -1097,6 +1097,7 @@ class RayPPOTrainer:
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
+                gen_batch.meta_info["epoch"] = epoch
                 gen_batch_output = gen_batch.repeat(
                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                 )
@@ -1170,9 +1171,21 @@ class RayPPOTrainer:
                         else:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
+                    # Log-prob / ref / value workers only need tensor fields and
+                    # optional multi_modal_inputs. Avoid broadcasting large
+                    # trajectory metadata such as tool_interact_info,
+                    # traj_stop_reason, or debug payloads to every worker.
+                    model_forward_non_tensor_keys = []
+                    if "multi_modal_inputs" in batch.non_tensor_batch:
+                        model_forward_non_tensor_keys.append("multi_modal_inputs")
+                    model_forward_batch = batch.select(
+                        batch_keys=list(batch.batch.keys()),
+                        non_tensor_batch_keys=model_forward_non_tensor_keys,
+                    )
+
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
-                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                        old_log_prob = self.actor_rollout_wg.compute_log_prob(model_forward_batch)
                         entropys = old_log_prob.batch["entropys"]
                         response_masks = batch.batch["response_mask"]
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
@@ -1192,15 +1205,15 @@ class RayPPOTrainer:
                         # compute reference log_prob
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
                             if not self.ref_in_actor:
-                                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(model_forward_batch)
                             else:
-                                ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
+                                ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(model_forward_batch)
                             batch = batch.union(ref_log_prob)
 
                     # compute values
                     if self.use_critic:
                         with marked_timer("values", timing_raw, color="cyan"):
-                            values = self.critic_wg.compute_values(batch)
+                            values = self.critic_wg.compute_values(model_forward_batch)
                             batch = batch.union(values)
 
                     with marked_timer("adv", timing_raw, color="brown"):

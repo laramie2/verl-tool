@@ -116,6 +116,35 @@ sampler:
   # the name of the curriculum class like `MySampler`
   class_name: null
 
+# 添加用于分层采样的配置
+# Field used by stratified samplers. Dot paths such as extra_info.source are supported.
+  field: data_source
+
+  # Labels to balance across batches. If null, labels are inferred from sampler.field.
+  labels: null
+
+  # Row ranges for already-concatenated datasets without an explicit source label.
+  label_ranges: null
+
+  # Matching mode for labels against sampler.field. Options: exact, contains, regex.
+  match_mode: exact
+
+  # Optional per-label ratios. If null, each label gets an equal share of every batch.
+  ratios: null
+
+  # Optional exact per-label counts per train batch. Overrides ratios when set.
+  per_label_counts: null
+
+  # Whether to shuffle examples inside each balanced batch.
+  shuffle_within_batch: True
+
+  # Whether to reshuffle the stratified order each dataloader epoch.
+  reshuffle_each_epoch: True
+
+  # Whether to drop samples that cannot form a complete balanced batch.
+  drop_remainder: True
+
+
 # Data generation configuration for augmenting the dataset.
 datagen:
 

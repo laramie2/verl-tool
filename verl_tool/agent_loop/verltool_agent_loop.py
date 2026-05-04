@@ -125,6 +125,7 @@ class AgentActorConfig:
     # experimental features
     mask_void_traj: bool=False # whether to mask the void trajectory (no tool call and no final answer)
     logprobs: bool=False # whether to return logprobs for each generated token
+    compact_tool_interact_info: bool=False # whether to keep only lightweight tool interaction info in training batches
     
 def sanitize_request(obj: Any) -> Any:
     """
@@ -147,6 +148,45 @@ def sanitize_request(obj: Any) -> Any:
         return encode_image(obj)
     else:
         return obj
+
+
+def compact_tool_interact_info_entries(tool_interact_info: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop large observation payloads while keeping MT-GRPO-relevant signals."""
+    compacted = []
+    for info in tool_interact_info:
+        if info is None:
+            compacted.append(None)
+            continue
+
+        obs = info.get("obs", "")
+        obs_is_str = isinstance(obs, str)
+        obs_nonempty = bool(obs.strip()) if obs_is_str else False
+        obs_lower = obs.lower() if obs_is_str else ""
+
+        compacted.append(
+            {
+                "valid_action": bool(info.get("valid_action", False)),
+                "success": info.get("success", None),
+                "done": bool(info.get("done", False)),
+                "finish": bool(info.get("finish", False)),
+                "reward": info.get("reward", None),
+                "invalid_reason": info.get("invalid_reason", None),
+                "obs_nonempty": obs_nonempty,
+                "obs_is_error": (
+                    ("Error:" in obs)
+                    or ("Traceback" in obs)
+                    or ("exception" in obs_lower)
+                )
+                if obs_is_str
+                else False,
+                "obs_has_result_or_output": (
+                    ("<result>" in obs) or ("<output>" in obs)
+                )
+                if obs_is_str
+                else False,
+            }
+        )
+    return compacted
     
 @register("verltool_agent")
 class VerlToolAgentLoop(AgentLoopBase):
@@ -154,6 +194,7 @@ class VerlToolAgentLoop(AgentLoopBase):
     _init_lock = threading.Lock()
     _session: aiohttp.ClientSession | None = None
     _session_lock = asyncio.Lock()
+    _rollout_log_lock = threading.Lock()
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -283,6 +324,98 @@ class VerlToolAgentLoop(AgentLoopBase):
             await cls._session.close()
             cls._session = None
             logging.info("Closed shared aiohttp ClientSession for AgentLoopWorker")
+
+    @staticmethod
+    def _json_safe(value: Any) -> Any:
+        if isinstance(value, np.ndarray):
+            return [VerlToolAgentLoop._json_safe(item) for item in value.tolist()]
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, dict):
+            return {str(VerlToolAgentLoop._json_safe(k)): VerlToolAgentLoop._json_safe(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [VerlToolAgentLoop._json_safe(item) for item in value]
+        if isinstance(value, Image.Image):
+            return f"<PIL.Image mode={value.mode} size={value.size}>"
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return str(value)
+
+    @staticmethod
+    def _rollout_log_epoch(config, global_step: int, epoch: Any, validate: bool) -> Any:
+        if epoch is not None:
+            try:
+                return int(epoch)
+            except (TypeError, ValueError):
+                return str(epoch)
+
+        if global_step is None or global_step < 0:
+            return "unknown"
+
+        total_epochs = int(config.trainer.get("total_epochs", 0) or 0)
+        total_steps = config.actor_rollout_ref.actor.optim.get("total_training_steps", None)
+        if total_steps in (None, -1):
+            total_steps = config.trainer.get("total_training_steps", None)
+        if total_epochs <= 0 or total_steps in (None, -1):
+            return "unknown"
+
+        steps_per_epoch = max(int(total_steps) // total_epochs, 1)
+        return int(global_step) // steps_per_epoch
+
+    @staticmethod
+    def _rollout_log_path(log_dir: str, epoch: Any, validate: bool) -> str:
+        if isinstance(epoch, int):
+            epoch_name = f"{epoch:04d}"
+        else:
+            epoch_name = str(epoch)
+        prefix = "validation_epoch" if validate else "epoch"
+        return os.path.join(log_dir, f"{prefix}_{epoch_name}.jsonl")
+
+    @staticmethod
+    def _rollout_log_dir(config) -> str:
+        trainer_config = config.get("trainer", {})
+        project_name = str(trainer_config.get("project_name", "unknown_project"))
+        experiment_name = str(trainer_config.get("experiment_name", "unknown_experiment"))
+
+        def safe_name(name: str) -> str:
+            name = re.sub(r"[^A-Za-z0-9_.=-]+", "_", name).strip("._")
+            return name or "unknown"
+
+        return str(
+            project_root
+            / "RL"
+            / "logs"
+            / "verltool_agent_loop"
+            / safe_name(project_name)
+            / safe_name(experiment_name)
+        )
+
+    @classmethod
+    def _append_rollout_jsonl(cls, log_filename: str, context: dict[str, Any], event: str, payload: dict[str, Any]):
+        record = {
+            "schema_version": 1,
+            "written_at": datetime.now().isoformat(timespec="milliseconds"),
+            "event": event,
+            **context,
+            **payload,
+        }
+        line = json.dumps(cls._json_safe(record), ensure_ascii=False) + "\n"
+
+        os.makedirs(os.path.dirname(log_filename), exist_ok=True)
+        with cls._rollout_log_lock:
+            with open(log_filename, "a", encoding="utf-8") as f:
+                try:
+                    import fcntl
+
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                    f.write(line)
+                    f.flush()
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                except ImportError:
+                    f.write(line)
+                    f.flush()
 
     async def _aiohttp_request(self, payload: dict):
         max_retries = self.agent_config.tool_call_max_retries
@@ -987,9 +1120,28 @@ class VerlToolAgentLoop(AgentLoopBase):
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         request_id = str(uuid4().hex)
         
-        log_dir = str(project_root/f"RL/logs/verltool_agent_loop/{time_str}")
+        log_dir = self._rollout_log_dir(self.config)
         os.makedirs(log_dir, exist_ok=True) 
-        log_filename = os.path.join(log_dir, f"agent_traj_{request_id[-6:]}.txt")
+        rollout_global_step = int(kwargs.get("_rollout_global_step", -1))
+        rollout_epoch = self._rollout_log_epoch(
+            self.config,
+            rollout_global_step,
+            kwargs.get("_rollout_epoch"),
+            kwargs.get("validate", False),
+        )
+        log_filename = self._rollout_log_path(log_dir, rollout_epoch, kwargs.get("validate", False))
+        log_context = {
+            "trajectory_id": request_id,
+            "trajectory_suffix": request_id[-6:],
+            "run_started_at": time_str,
+            "project_name": self.config.trainer.get("project_name", "unknown_project"),
+            "experiment_name": self.config.trainer.get("experiment_name", "unknown_experiment"),
+            "global_step": rollout_global_step,
+            "epoch": rollout_epoch,
+            "sample_index": kwargs.get("_rollout_sample_index"),
+            "rollout_n": kwargs.get("_rollout_n"),
+            "validate": kwargs.get("validate", False),
+        }
         
         prompt_ids = list(kwargs["raw_prompt_ids"])
         multi_modal_data = kwargs.get("multi_modal_data") or {}
@@ -1068,11 +1220,20 @@ class VerlToolAgentLoop(AgentLoopBase):
         
         # ================= [新增日志：记录初始原始 Prompt] =================      
         initial_prompt_text = self.tokenizer.decode(running_prompt_ids, skip_special_tokens=False)
-        with open(log_filename, "a", encoding="utf-8") as f:
-            f.write(f"\n{'#'*30} [TRAJECTORY START: {request_id}] {'#'*30}\n")
-            f.write(f"🚀 [Initial Prompt]:\n")
-            f.write(initial_prompt_text + "\n")
-            f.write(f"{'#'*80}\n\n")
+        self._append_rollout_jsonl(
+            log_filename,
+            log_context,
+            "trajectory_start",
+            {
+                "initial_prompt": initial_prompt_text,
+                "initial_prompt_tokens": token_stats["initial_prompt_tokens"],
+                "use_tool": use_tool,
+                "max_turns": max_turns,
+                "max_response_length": max_response_length,
+                "max_action_length": max_action_length,
+                "max_obs_length": max_obs_length,
+            },
+        )
         # =================================================================
         
         # [修改点] 循环外的初始化：强行触发 Step 0 的环境交互 (Action 为空)
@@ -1111,12 +1272,27 @@ class VerlToolAgentLoop(AgentLoopBase):
                 # =====================================================================
 
                 # ================= [新增日志：写入文件记录工具反馈] =================                
-                with open(log_filename, "a", encoding="utf-8") as f:
-                    if step == 0:
-                        f.write(f"\n{'='*20} [Step {step}] 🌍 初始环境观测 {'='*20}\n")
-                    else:
-                        f.write(f"\n{'='*20} [Step {step}] 🔧 工具返回 {'='*20}\n")
-                    f.write(obs_text if obs_text.strip() else "[警告：工具返回了空内容！]\n")
+                self._append_rollout_jsonl(
+                    log_filename,
+                    log_context,
+                    "environment_observation",
+                    {
+                        "turn": step,
+                        "observation_type": "initial" if step == 0 else "tool",
+                        "observation": obs_text if obs_text.strip() else "",
+                        "empty_observation": not bool(obs_text.strip()),
+                        "raw_observation_tokens": raw_text_len,
+                        "tool_status": {
+                            "done": tool_results.get("done"),
+                            "valid_action": tool_results.get("valid_action"),
+                            "reward": tool_results.get("reward"),
+                            "success": tool_results.get("success"),
+                            "processing_time_ms": tool_results.get("processing_time_ms"),
+                            "interact_time_ms": tool_results.get("interact_time_ms"),
+                            "response_size_mb": tool_results.get("response_size_mb"),
+                        },
+                    },
+                )
                 # =================================================================
 
                 # =====================================================================
@@ -1124,7 +1300,7 @@ class VerlToolAgentLoop(AgentLoopBase):
                 # =====================================================================
                 COMPRESSION_THRESHOLD = 0 
                 if getattr(self.agent_config, 'enable_obs_compression', True) and len(obs_text) > COMPRESSION_THRESHOLD:
-                    saved_dir = str(project_root/f"RL/logs/verltool_agent_loop/{time_str}/obs_img")
+                    saved_dir = os.path.join(log_dir, "obs_img")
                     os.makedirs(saved_dir, exist_ok=True)
                     
                     loop = asyncio.get_event_loop()
@@ -1152,6 +1328,17 @@ class VerlToolAgentLoop(AgentLoopBase):
                     
                     img_path = f"{saved_dir}/compressed_obs_{request_id[-6:]}_step{step}.png"
                     await loop.run_in_executor(None, compressed_img.save, img_path)
+                    # self._append_rollout_jsonl(
+                    #     log_filename,
+                    #     log_context,
+                    #     "observation_compressed",
+                    #     {
+                    #         "turn": step,
+                    #         "image_path": img_path,
+                    #         "compression_factor": COMPRESSION_FACTOR,
+                    #         "raw_observation_tokens": raw_text_len,
+                    #     },
+                    # )
                     
                     import io
                     import base64
@@ -1319,9 +1506,19 @@ class VerlToolAgentLoop(AgentLoopBase):
             # =====================================================================
 
             # =================================================================
-            with open(log_filename, "a", encoding="utf-8") as f:
-                f.write(f"\n{'='*20} [Step {step}] 🤖 模型生成 {'='*20}\n")
-                f.write(gen_text + "\n")
+            self._append_rollout_jsonl(
+                log_filename,
+                log_context,
+                "model_generation",
+                {
+                    "turn": step,
+                    "text": gen_text,
+                    "token_count": len(gen_ids),
+                    "finish_reason": output.finish_reason,
+                    "stop_reason": output.stop_reason,
+                    "mean_logprob": float(np.mean(gen_logprobs)) if len(gen_logprobs) > 0 else 0.0,
+                },
+            )
             # =================================================================
 
             running_prompt_ids.extend(gen_ids)
@@ -1353,9 +1550,17 @@ class VerlToolAgentLoop(AgentLoopBase):
                     break
             
             # =================================================================
-            with open(log_filename, "a", encoding="utf-8") as f:
-                f.write(f"\n{'='*20} [Step {step}] 🔧 动作截取 {'='*20}\n")
-                f.write(action_text if action_text.strip() else "[警告：生成了空动作！]\n")
+            self._append_rollout_jsonl(
+                log_filename,
+                log_context,
+                "action_extract",
+                {
+                    "turn": step,
+                    "do_action": do_action,
+                    "action": action_text if action_text.strip() else "",
+                    "empty_action": not bool(action_text.strip()),
+                },
+            )
             # =================================================================
 
             # =====================================================================
@@ -1517,27 +1722,29 @@ class VerlToolAgentLoop(AgentLoopBase):
         tokens_saved = original_cost - actual_cost
         compression_ratio = (original_cost / actual_cost) if actual_cost > 0 else 1.0
 
-        with open(log_filename, "a", encoding="utf-8") as f:
-            f.write(f"\n{'='*25} [TRAJECTORY SUMMARY] {'='*25}\n")
-            f.write(f"🛑 Trajectory Stop Reason: {traj_stop_reason}\n\n")
-            f.write(f"📊 Token Usage Statistics:\n")
-            f.write(f"  ├─ Initial Prompt:   {token_stats['initial_prompt_tokens']:>6} tokens\n")
-            f.write(f"  ├─ Model Generation: {token_stats['total_gen_tokens']:>6} tokens\n")
-            f.write(f"  ├─ Environment Obs (Compression Impact):\n")
-            f.write(f"  │    ├─ Original Text Cost: {original_cost:>6} tokens (Without Compression)\n")
-            f.write(f"  │    ├─ Actual Model Input: {actual_cost:>6} tokens (Text Placeholder + Visual Tokens)\n")
-            f.write(f"  │    │    ├─ Visual Tokens: {token_stats['total_obs_image_tokens']:>6} tokens\n")
-            f.write(f"  │    │    └─ Audio Tokens:  {token_stats['total_obs_audio_tokens']:>6} tokens\n")
-            
-            if tokens_saved > 0:
-                f.write(f"  │    └─ 🟢 Net Tokens Saved: {tokens_saved:>6} tokens (Compression Ratio: {compression_ratio:.2f}x)\n")
-            elif tokens_saved < 0:
-                f.write(f"  │    └─ 🔴 Net Tokens Added: {abs(tokens_saved):>6} tokens (Image costs more than original text)\n")
-            else:
-                f.write(f"  │    └─ ⚪ Net Tokens Saved:      0 tokens\n")
-                
-            f.write(f"  └─ Grand Total Fed:  {total_actual_tokens:>6} tokens\n")
-            f.write(f"{'='*72}\n")
+        # self._append_rollout_jsonl(
+        #     log_filename,
+        #     log_context,
+        #     "trajectory_summary",
+        #     {
+        #         "stop_reason": traj_stop_reason,
+        #         "is_traj_finished": stats_dict["is_traj_finished"],
+        #         "valid_traj": stats_dict["valid_traj"],
+        #         "num_turns": stats_dict["num_turns"],
+        #         "token_usage": {
+        #             "initial_prompt": token_stats["initial_prompt_tokens"],
+        #             "model_generation": token_stats["total_gen_tokens"],
+        #             "obs_original_text": original_cost,
+        #             "obs_actual_fed": actual_cost,
+        #             "obs_image": token_stats["total_obs_image_tokens"],
+        #             "obs_audio": token_stats["total_obs_audio_tokens"],
+        #             "saved_by_compression": tokens_saved,
+        #             "compression_ratio": compression_ratio,
+        #             "grand_total_fed": total_actual_tokens,
+        #         },
+        #         "verl_tool_metrics": verl_tool_metrics,
+        #     },
+        # )
             
         # 同步更新 verl_tool_metrics (供 Wandb 监控大盘使用)
         verl_tool_metrics.update({
@@ -1551,6 +1758,10 @@ class VerlToolAgentLoop(AgentLoopBase):
         })
         # =====================================================================
 
+        tool_interact_info = stats_dict.get("tool_interact_info", [])
+        if self.agent_config.compact_tool_interact_info:
+            tool_interact_info = compact_tool_interact_info_entries(tool_interact_info)
+
         output = AgentLoopOutput(
             prompt_ids=prompt_ids,
             response_ids=response_ids[: self.response_length],
@@ -1559,6 +1770,6 @@ class VerlToolAgentLoop(AgentLoopBase):
             multi_modal_data=multi_modal_output,
             num_turns=stats_dict["num_turns"],
             metrics=metrics,
-            extra_fields={"tool_interact_info": stats_dict.get("tool_interact_info", []), "traj_stop_reason": traj_stop_reason, "verl_tool_metrics": verl_tool_metrics},
+            extra_fields={"tool_interact_info": tool_interact_info, "traj_stop_reason": traj_stop_reason, "verl_tool_metrics": verl_tool_metrics},
         )
         return output

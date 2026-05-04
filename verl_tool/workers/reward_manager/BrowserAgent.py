@@ -48,8 +48,8 @@ class WikiRLRewardManager:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.compute_score = compute_score or _default_compute_score
-        self.fuzzy_weight = 0.7
-        self.structure_weight = 0.3
+        self.fuzzy_weight = 0.9
+        self.structure_weight = 0.1
         if "record_dir" in kwargs:
             self.record_dir = Path(kwargs['record_dir'])
             self.record_dir.mkdir(parents=True, exist_ok=True)
