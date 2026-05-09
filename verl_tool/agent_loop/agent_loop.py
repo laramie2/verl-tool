@@ -687,6 +687,8 @@ class AgentLoopWorker:
                 if self.config.actor_rollout_ref.agent.get("pass_extra_fields_to_reward", True):
                     extra_fields = {}
                     for key, val in output.extra_fields.items():
+                        if key.startswith("_rollout_"):
+                            continue
                         extra_fields[key] = np.array([val], dtype=object)
                     non_tensor_batch.update(extra_fields)
                 data = DataProto(
@@ -701,6 +703,22 @@ class AgentLoopWorker:
                 result = await self.reward_manager_worker.compute_score.remote(data)
                 output.reward_score = result["reward_score"]
                 output.extra_fields["reward_extra_info"] = result["reward_extra_info"]
+
+            rollout_log_info = output.extra_fields.pop("_rollout_log_info", None)
+            if rollout_log_info and hasattr(agent_loop, "_append_rollout_jsonl"):
+                try:
+                    summary = dict(rollout_log_info.get("summary", {}))
+                    summary["final_reward"] = output.reward_score
+                    summary["reward_available"] = output.reward_score is not None
+                    summary["reward_extra_info"] = output.extra_fields.get("reward_extra_info", {})
+                    agent_loop._append_rollout_jsonl(
+                        rollout_log_info["log_filename"],
+                        rollout_log_info["context"],
+                        "trajectory_summary",
+                        summary,
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to append rollout trajectory_summary: {e}")
                 
             return _InternalAgentLoopOutput(
                 prompt_ids=prompt_output["input_ids"],

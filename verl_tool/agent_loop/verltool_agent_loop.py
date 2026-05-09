@@ -344,6 +344,18 @@ class VerlToolAgentLoop(AgentLoopBase):
         return str(value)
 
     @staticmethod
+    def _log_scalar(value: Any, default: str = "unknown") -> str:
+        if isinstance(value, np.ndarray):
+            if value.size == 0:
+                return default
+            value = value.reshape(-1)[0]
+        if isinstance(value, np.generic):
+            value = value.item()
+        if value in (None, ""):
+            return default
+        return str(value)
+
+    @staticmethod
     def _rollout_log_epoch(config, global_step: int, epoch: Any, validate: bool) -> Any:
         if epoch is not None:
             try:
@@ -1130,6 +1142,19 @@ class VerlToolAgentLoop(AgentLoopBase):
             kwargs.get("validate", False),
         )
         log_filename = self._rollout_log_path(log_dir, rollout_epoch, kwargs.get("validate", False))
+        extra_info_for_log = kwargs.get("extra_info", {})
+        if not isinstance(extra_info_for_log, dict):
+            extra_info_for_log = {}
+        data_source = "unknown"
+        for candidate in (
+            kwargs.get("data_source"),
+            extra_info_for_log.get("data_source"),
+            kwargs.get("ability"),
+        ):
+            candidate = self._log_scalar(candidate, default="")
+            if candidate:
+                data_source = candidate
+                break
         log_context = {
             "trajectory_id": request_id,
             "trajectory_suffix": request_id[-6:],
@@ -1141,6 +1166,8 @@ class VerlToolAgentLoop(AgentLoopBase):
             "sample_index": kwargs.get("_rollout_sample_index"),
             "rollout_n": kwargs.get("_rollout_n"),
             "validate": kwargs.get("validate", False),
+            "data_source": data_source,
+            "task_category": data_source,
         }
         
         prompt_ids = list(kwargs["raw_prompt_ids"])
@@ -1218,15 +1245,15 @@ class VerlToolAgentLoop(AgentLoopBase):
 
         logger.debug(f"Starting agent loop for traj_id={request_id} with use_tool={use_tool}, max_turns={max_turns}, max_response_length={max_response_length}, max_action_length={max_action_length}, max_obs_length={max_obs_length}")
         
-        # ================= [新增日志：记录初始原始 Prompt] =================      
-        initial_prompt_text = self.tokenizer.decode(running_prompt_ids, skip_special_tokens=False)
+        # ================= [新增日志：记录轨迹元信息] =================
         self._append_rollout_jsonl(
             log_filename,
             log_context,
             "trajectory_start",
             {
-                "initial_prompt": initial_prompt_text,
-                "initial_prompt_tokens": token_stats["initial_prompt_tokens"],
+                "token_usage": {
+                    "initial_prompt": token_stats["initial_prompt_tokens"],
+                },
                 "use_tool": use_tool,
                 "max_turns": max_turns,
                 "max_response_length": max_response_length,
@@ -1549,20 +1576,6 @@ class VerlToolAgentLoop(AgentLoopBase):
                     action_text = gen_text[:last_idx + len(ext_token)]
                     break
             
-            # =================================================================
-            self._append_rollout_jsonl(
-                log_filename,
-                log_context,
-                "action_extract",
-                {
-                    "turn": step,
-                    "do_action": do_action,
-                    "action": action_text if action_text.strip() else "",
-                    "empty_action": not bool(action_text.strip()),
-                },
-            )
-            # =================================================================
-
             # =====================================================================
             # [结束条件检查 (End Conditions Check)]
             # =====================================================================
@@ -1722,29 +1735,26 @@ class VerlToolAgentLoop(AgentLoopBase):
         tokens_saved = original_cost - actual_cost
         compression_ratio = (original_cost / actual_cost) if actual_cost > 0 else 1.0
 
-        # self._append_rollout_jsonl(
-        #     log_filename,
-        #     log_context,
-        #     "trajectory_summary",
-        #     {
-        #         "stop_reason": traj_stop_reason,
-        #         "is_traj_finished": stats_dict["is_traj_finished"],
-        #         "valid_traj": stats_dict["valid_traj"],
-        #         "num_turns": stats_dict["num_turns"],
-        #         "token_usage": {
-        #             "initial_prompt": token_stats["initial_prompt_tokens"],
-        #             "model_generation": token_stats["total_gen_tokens"],
-        #             "obs_original_text": original_cost,
-        #             "obs_actual_fed": actual_cost,
-        #             "obs_image": token_stats["total_obs_image_tokens"],
-        #             "obs_audio": token_stats["total_obs_audio_tokens"],
-        #             "saved_by_compression": tokens_saved,
-        #             "compression_ratio": compression_ratio,
-        #             "grand_total_fed": total_actual_tokens,
-        #         },
-        #         "verl_tool_metrics": verl_tool_metrics,
-        #     },
-        # )
+        trajectory_summary = {
+            "stop_reason": traj_stop_reason,
+            "is_traj_finished": stats_dict["is_traj_finished"],
+            "valid_traj": stats_dict["valid_traj"],
+            "num_turns": stats_dict["num_turns"],
+            "data_source": data_source,
+            "task_category": data_source,
+            "token_usage": {
+                "initial_prompt": token_stats["initial_prompt_tokens"],
+                "model_generation": token_stats["total_gen_tokens"],
+                "obs_original_text": original_cost,
+                "obs_actual_fed": actual_cost,
+                "obs_image": token_stats["total_obs_image_tokens"],
+                "obs_audio": token_stats["total_obs_audio_tokens"],
+                "saved_by_compression": tokens_saved,
+                "compression_ratio": compression_ratio,
+                "grand_total_fed": total_actual_tokens,
+            },
+            "reward_from_tool": stats_dict["rewards"][-1] if stats_dict["rewards"] else None,
+        }
             
         # 同步更新 verl_tool_metrics (供 Wandb 监控大盘使用)
         verl_tool_metrics.update({
@@ -1770,6 +1780,15 @@ class VerlToolAgentLoop(AgentLoopBase):
             multi_modal_data=multi_modal_output,
             num_turns=stats_dict["num_turns"],
             metrics=metrics,
-            extra_fields={"tool_interact_info": tool_interact_info, "traj_stop_reason": traj_stop_reason, "verl_tool_metrics": verl_tool_metrics},
+            extra_fields={
+                "tool_interact_info": tool_interact_info,
+                "traj_stop_reason": traj_stop_reason,
+                "verl_tool_metrics": verl_tool_metrics,
+                "_rollout_log_info": {
+                    "log_filename": log_filename,
+                    "context": log_context,
+                    "summary": trajectory_summary,
+                },
+            },
         )
         return output
