@@ -150,18 +150,88 @@ def sanitize_request(obj: Any) -> Any:
         return obj
 
 
+OBS_ELEMENT_RE = re.compile(r"^[\t ]*(?:\[|<)(\d+)(?:\]|>)\s+([a-zA-Z]+)", re.MULTILINE)
+ACTION_BLOCK_RE = re.compile(r"```(.*?)```|<action>(.*?)</action>", re.DOTALL)
+TARGET_ACTION_RE = re.compile(r"^(click|type|hover|tab_focus)\s+(?:\[|<)(\d+)(?:\]|>)")
+
+
+def _browser_obs_elements(observation: str) -> dict[str, str]:
+    return {
+        match.group(1): match.group(2).lower()
+        for match in OBS_ELEMENT_RE.finditer(observation or "")
+    }
+
+
+def _browser_extract_action(action_text: str) -> str:
+    action_text = (action_text or "").strip()
+    matches = list(ACTION_BLOCK_RE.finditer(action_text))
+    if matches:
+        match = matches[-1]
+        return (match.group(1) or match.group(2) or "").strip()
+    return action_text
+
+
+def _browser_is_element_mismatch(verb: str, target_type: str) -> bool:
+    if verb == "type":
+        return target_type not in {"textbox", "searchbox", "textarea", "combobox", "input"}
+    if verb in {"click", "hover"}:
+        return target_type in {
+            "statictext",
+            "heading",
+            "rootwebarea",
+            "row",
+            "cell",
+            "table",
+            "group",
+            "paragraph",
+            "text",
+        }
+    return False
+
+
 def compact_tool_interact_info_entries(tool_interact_info: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Drop large observation payloads while keeping MT-GRPO-relevant signals."""
+    """Drop large observations while keeping reward-relevant browser action signals."""
     compacted = []
+    previous_obs = ""
     for info in tool_interact_info:
         if info is None:
             compacted.append(None)
             continue
 
         obs = info.get("obs", "")
+        obs_for_reward = info.get("browser_obs_for_reward", obs)
         obs_is_str = isinstance(obs, str)
         obs_nonempty = bool(obs.strip()) if obs_is_str else False
         obs_lower = obs.lower() if obs_is_str else ""
+
+        action = _browser_extract_action(str(info.get("action", "")))
+        action_match = TARGET_ACTION_RE.match(action)
+        action_reward_fields = {
+            "action": action,
+            "action_verb": action.split()[0] if action else "",
+            "action_target_id": None,
+            "action_target_type": None,
+            "target_id_exists": None,
+            "element_type_match": None,
+        }
+        if action_match:
+            verb = action_match.group(1)
+            target_id = action_match.group(2)
+            elements = _browser_obs_elements(previous_obs)
+            target_type = elements.get(target_id)
+            action_reward_fields.update(
+                {
+                    "action_verb": verb,
+                    "action_target_id": target_id,
+                    "action_target_type": target_type,
+                    "target_id_exists": target_id in elements,
+                    "element_type_match": (
+                        None
+                        if target_type is None
+                        else not _browser_is_element_mismatch(verb, target_type)
+                    ),
+                }
+            )
 
         compacted.append(
             {
@@ -184,8 +254,11 @@ def compact_tool_interact_info_entries(tool_interact_info: list[dict[str, Any]])
                 )
                 if obs_is_str
                 else False,
+                **action_reward_fields,
             }
         )
+        if isinstance(obs_for_reward, str):
+            previous_obs = obs_for_reward
     return compacted
     
 @register("verltool_agent")
@@ -387,6 +460,11 @@ class VerlToolAgentLoop(AgentLoopBase):
 
     @staticmethod
     def _rollout_log_dir(config) -> str:
+        explicit_log_dir = os.environ.get("VERLTOOL_AGENT_LOOP_LOG_DIR")
+        if explicit_log_dir:
+            return explicit_log_dir
+
+        log_root = os.environ.get("VERLTOOL_AGENT_LOOP_LOG_ROOT")
         trainer_config = config.get("trainer", {})
         project_name = str(trainer_config.get("project_name", "unknown_project"))
         experiment_name = str(trainer_config.get("experiment_name", "unknown_experiment"))
@@ -395,14 +473,12 @@ class VerlToolAgentLoop(AgentLoopBase):
             name = re.sub(r"[^A-Za-z0-9_.=-]+", "_", name).strip("._")
             return name or "unknown"
 
-        return str(
-            project_root
-            / "RL"
-            / "logs"
-            / "verltool_agent_loop"
-            / safe_name(project_name)
-            / safe_name(experiment_name)
-        )
+        if log_root:
+            base_dir = Path(log_root)
+        else:
+            base_dir = project_root / "RL" / "logs" / "verltool_agent_loop"
+
+        return str(base_dir / safe_name(project_name) / safe_name(experiment_name))
 
     @classmethod
     def _append_rollout_jsonl(cls, log_filename: str, context: dict[str, Any], event: str, payload: dict[str, Any]):
@@ -1291,6 +1367,9 @@ class VerlToolAgentLoop(AgentLoopBase):
                 tool_results['interact_time_ms'] = (end - start) * 1000.0
                 
                 obs_text = tool_results['obs']
+                # Keep the text observation that the model saw before compression so
+                # action-ID rewards can be computed against real browser element IDs.
+                tool_results["browser_obs_for_reward"] = obs_text
 
                 # ================= [新增模块: 截获压缩前的原始文本 Token] =================
                 # 记录未经任何压缩的原始环境反馈长度，用于后续评估压缩率

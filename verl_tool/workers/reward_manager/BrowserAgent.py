@@ -1,6 +1,7 @@
 import nltk
 import json
 import torch
+import numpy as np
 
 from verl import DataProto
 from verl.utils.reward_score import _default_compute_score
@@ -19,6 +20,153 @@ from mini_webarena.evaluator import metric_heuristic
 # ------------------------------------------------------------------------------
 # WikiRL Reward Manager
 # ------------------------------------------------------------------------------
+
+OBS_ELEMENT_RE = re.compile(r"^[\t ]*(?:\[|<)(\d+)(?:\]|>)\s+([a-zA-Z]+)", re.MULTILINE)
+ACTION_BLOCK_RE = re.compile(r"```(.*?)```|<action>(.*?)</action>", re.DOTALL)
+TARGET_ACTION_RE = re.compile(r"^(click|type|hover|tab_focus)\s+(?:\[|<)(\d+)(?:\]|>)")
+
+
+def _as_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return default
+
+
+def _as_float(value, default):
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _config_value(kwargs, key, env_key, default):
+    return kwargs.get(key, os.getenv(env_key, default))
+
+
+def extract_browser_action(action_text: str) -> str:
+    action_text = (action_text or "").strip()
+    matches = list(ACTION_BLOCK_RE.finditer(action_text))
+    if matches:
+        match = matches[-1]
+        return (match.group(1) or match.group(2) or "").strip()
+    return action_text
+
+
+def obs_elements(observation: str) -> dict[str, str]:
+    return {
+        match.group(1): match.group(2).lower()
+        for match in OBS_ELEMENT_RE.finditer(observation or "")
+    }
+
+
+def is_element_mismatch(verb: str, target_type: str) -> bool:
+    if verb == "type":
+        return target_type not in {"textbox", "searchbox", "textarea", "combobox", "input"}
+    if verb in {"click", "hover"}:
+        return target_type in {
+            "statictext",
+            "heading",
+            "rootwebarea",
+            "row",
+            "cell",
+            "table",
+            "group",
+            "paragraph",
+            "text",
+        }
+    return False
+
+
+def browser_action_process_reward(tool_interact_info) -> dict[str, float]:
+    """Score whether browser actions target valid, compatible elements."""
+    if isinstance(tool_interact_info, np.ndarray):
+        tool_interact_info = tool_interact_info.tolist()
+    if not tool_interact_info:
+        return {
+            "action_correctness_score": 0.0,
+            "hallucinated_id_penalty": 0.0,
+            "tool_invalid_penalty": 0.0,
+            "num_target_actions": 0,
+            "num_correct_actions": 0,
+            "num_hallucinated_ids": 0,
+            "num_element_mismatches": 0,
+            "num_tool_invalid": 0,
+        }
+
+    target_actions = 0
+    correct_actions = 0
+    incorrect_actions = 0
+    hallucinated_ids = 0
+    element_mismatches = 0
+    tool_invalid = 0
+    total_actions = 0
+    previous_obs = ""
+
+    for info in tool_interact_info:
+        if not isinstance(info, dict):
+            continue
+
+        action = extract_browser_action(str(info.get("action", "")))
+        if action:
+            total_actions += 1
+        if info.get("valid_action") in (0, False):
+            tool_invalid += 1
+
+        action_match = TARGET_ACTION_RE.match(action)
+        if action_match:
+            target_actions += 1
+            target_exists = info.get("target_id_exists", None)
+            type_match = info.get("element_type_match", None)
+            action_is_tool_invalid = info.get("valid_action") in (0, False)
+
+            if target_exists is None:
+                elements = obs_elements(previous_obs)
+                target_id = action_match.group(2)
+                target_type = elements.get(target_id)
+                target_exists = target_id in elements
+                type_match = (
+                    None
+                    if target_type is None
+                    else not is_element_mismatch(action_match.group(1), target_type)
+                )
+
+            if not target_exists:
+                hallucinated_ids += 1
+                incorrect_actions += 1
+            elif type_match is False:
+                element_mismatches += 1
+                incorrect_actions += 1
+            elif action_is_tool_invalid:
+                incorrect_actions += 1
+            else:
+                correct_actions += 1
+
+        obs = info.get("browser_obs_for_reward", info.get("obs", ""))
+        if isinstance(obs, str):
+            previous_obs = obs
+
+    denom = target_actions if target_actions else 1
+    action_correctness_score = (correct_actions - incorrect_actions) / denom
+    hallucinated_id_penalty = -hallucinated_ids / denom
+    tool_invalid_penalty = -tool_invalid / (total_actions if total_actions else 1)
+    return {
+        "action_correctness_score": float(action_correctness_score),
+        "hallucinated_id_penalty": float(hallucinated_id_penalty),
+        "tool_invalid_penalty": float(tool_invalid_penalty),
+        "num_target_actions": int(target_actions),
+        "num_correct_actions": int(correct_actions),
+        "num_hallucinated_ids": int(hallucinated_ids),
+        "num_element_mismatches": int(element_mismatches),
+        "num_tool_invalid": int(tool_invalid),
+    }
 
 def clean_text(text):
     # 删除控制字符 & 非打印字符
@@ -48,8 +196,45 @@ class WikiRLRewardManager:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.compute_score = compute_score or _default_compute_score
-        self.fuzzy_weight = 0.9
-        self.structure_weight = 0.1
+        self.fuzzy_weight = _as_float(
+            _config_value(kwargs, "answer_weight", "BROWSER_AGENT_ANSWER_WEIGHT", 0.9),
+            0.9,
+        )
+        self.structure_weight = _as_float(
+            _config_value(kwargs, "format_weight", "BROWSER_AGENT_FORMAT_WEIGHT", 0.1),
+            0.1,
+        )
+        self.enable_process_reward = _as_bool(
+            _config_value(kwargs, "enable_process_reward", "BROWSER_AGENT_ENABLE_PROCESS_REWARD", True),
+            True,
+        )
+        self.action_correctness_weight = _as_float(
+            _config_value(
+                kwargs,
+                "action_correctness_weight",
+                "BROWSER_AGENT_ACTION_CORRECTNESS_WEIGHT",
+                0.1,
+            ),
+            0.1,
+        )
+        self.hallucinated_id_penalty_weight = _as_float(
+            _config_value(
+                kwargs,
+                "hallucinated_id_penalty_weight",
+                "BROWSER_AGENT_HALLUCINATED_ID_PENALTY_WEIGHT",
+                0.1,
+            ),
+            0.1,
+        )
+        self.tool_invalid_penalty_weight = _as_float(
+            _config_value(
+                kwargs,
+                "tool_invalid_penalty_weight",
+                "BROWSER_AGENT_TOOL_INVALID_PENALTY_WEIGHT",
+                0.0,
+            ),
+            0.0,
+        )
         if "record_dir" in kwargs:
             self.record_dir = Path(kwargs['record_dir'])
             self.record_dir.mkdir(parents=True, exist_ok=True)
@@ -228,6 +413,16 @@ class WikiRLRewardManager:
         reward_tensor = torch.zeros_like(responses_id, dtype=torch.float32)
 
         answer_scores, format_scores = [], []
+        action_correctness_scores = []
+        hallucinated_id_penalties = []
+        tool_invalid_penalties = []
+        num_target_actions = []
+        num_correct_actions = []
+        num_hallucinated_ids = []
+        num_element_mismatches = []
+        num_tool_invalid = []
+        final_rewards = []
+        tool_interact_batch = data.non_tensor_batch.get("tool_interact_info", [None] * len(data))
 
         for i in range(len(data)):
             gts = data.non_tensor_batch["reward_model"][i]["ground_truth"]
@@ -235,9 +430,21 @@ class WikiRLRewardManager:
             answer_reward  = self.answer_score(pred, gts)
             uid = data.non_tensor_batch.get("uid", [None] * len(data))[i]
             format_reward = self.format_score(actions_list[i], uid=uid)
+            tool_interact_info = (
+                tool_interact_batch[i]
+                if isinstance(tool_interact_batch, (list, tuple, np.ndarray)) and i < len(tool_interact_batch)
+                else None
+            )
+            process_scores = browser_action_process_reward(tool_interact_info)
+            action_correctness_reward = process_scores["action_correctness_score"] if self.enable_process_reward else 0.0
+            hallucinated_id_penalty = process_scores["hallucinated_id_penalty"] if self.enable_process_reward else 0.0
+            tool_invalid_penalty = process_scores["tool_invalid_penalty"] if self.enable_process_reward else 0.0
             final_reward = (
                 self.fuzzy_weight * answer_reward +
-                self.structure_weight * format_reward
+                self.structure_weight * format_reward +
+                self.action_correctness_weight * action_correctness_reward +
+                self.hallucinated_id_penalty_weight * hallucinated_id_penalty +
+                self.tool_invalid_penalty_weight * tool_invalid_penalty
             )
 
             # reward_tensor[i, valid_resp_len[i].item() - 1] = final_reward
@@ -247,6 +454,15 @@ class WikiRLRewardManager:
 
             answer_scores.append(answer_reward)
             format_scores.append(format_reward)
+            action_correctness_scores.append(action_correctness_reward)
+            hallucinated_id_penalties.append(hallucinated_id_penalty)
+            tool_invalid_penalties.append(tool_invalid_penalty)
+            num_target_actions.append(process_scores["num_target_actions"])
+            num_correct_actions.append(process_scores["num_correct_actions"])
+            num_hallucinated_ids.append(process_scores["num_hallucinated_ids"])
+            num_element_mismatches.append(process_scores["num_element_mismatches"])
+            num_tool_invalid.append(process_scores["num_tool_invalid"])
+            final_rewards.append(final_reward)
 
         # ---------- 3.  persistent logging ---------------------------------
         # try:
@@ -291,6 +507,8 @@ class WikiRLRewardManager:
         print(f"Computed rewards for {len(data)} samples.")
         print("Answer scores:", answer_scores)
         print("Format scores:", format_scores)
+        print("Action correctness scores:", action_correctness_scores)
+        print("Hallucinated ID penalties:", hallucinated_id_penalties)
         
         if return_dict:
             return {
@@ -299,6 +517,15 @@ class WikiRLRewardManager:
                     # 把指标以 list 的形式传入，外层会提取 value[0] 记录到 wandb
                     "wiki_answer_score": answer_scores,
                     "wiki_format_score": format_scores,
+                    "browser_action_correctness_score": action_correctness_scores,
+                    "browser_hallucinated_id_penalty": hallucinated_id_penalties,
+                    "browser_tool_invalid_penalty": tool_invalid_penalties,
+                    "browser_num_target_actions": num_target_actions,
+                    "browser_num_correct_actions": num_correct_actions,
+                    "browser_num_hallucinated_ids": num_hallucinated_ids,
+                    "browser_num_element_mismatches": num_element_mismatches,
+                    "browser_num_tool_invalid": num_tool_invalid,
+                    "browser_final_reward": final_rewards,
                 }
             }
         

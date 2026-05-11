@@ -1,6 +1,7 @@
 import logging
 import math
 import re
+import csv
 from collections import defaultdict
 from collections.abc import Sized
 from typing import Any
@@ -219,3 +220,102 @@ class StratifiedSourceSampler(AbstractSampler):
         if isinstance(value, (str, bytes, dict)) or value is None:
             return False
         return isinstance(value, (list, tuple)) or value.__class__.__name__ == "ListConfig"
+
+
+class DifficultyBucketSampler(StratifiedSourceSampler):
+    """Stratified sampler over offline difficulty buckets.
+
+    Expected config:
+
+    data.sampler.class_path=pkg://verl_tool.trainer.stratified_sampler
+    data.sampler.class_name=DifficultyBucketSampler
+    data.sampler.difficulty_file=/path/to/sample_difficulty.csv
+    data.sampler.index_field=extra_info.index
+    data.sampler.labels=[bucket_0,bucket_1,bucket_2,bucket_3,bucket_4]
+    data.sampler.ratios=[8,8,16,16,16]
+
+    The CSV should contain sample_index and bucket columns. It is produced by
+    RL/logs/compute_sample_difficulty.py.
+    """
+
+    def _build_buckets(self) -> dict[str, list[int]]:
+        difficulty_file = self.sampler_config.get("difficulty_file", None)
+        if difficulty_file is None:
+            raise ValueError("DifficultyBucketSampler requires data.sampler.difficulty_file")
+
+        self.difficulty_map = self._load_difficulty_map(str(difficulty_file))
+        self.index_field = self.sampler_config.get("index_field", "extra_info.index")
+        self.missing_policy = self.sampler_config.get("missing_policy", "error")
+        self.missing_bucket = self.sampler_config.get("missing_bucket", None)
+        return self._build_difficulty_buckets()
+
+    def _load_difficulty_map(self, path: str) -> dict[str, str]:
+        bucket_field = self.sampler_config.get("bucket_field", "bucket")
+        sample_index_field = self.sampler_config.get("sample_index_field", "sample_index")
+        difficulty_map: dict[str, str] = {}
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            if sample_index_field not in reader.fieldnames or bucket_field not in reader.fieldnames:
+                raise ValueError(
+                    f"{path} must contain columns {sample_index_field!r} and {bucket_field!r}; "
+                    f"got {reader.fieldnames}"
+                )
+            for row in reader:
+                difficulty_map[str(row[sample_index_field])] = str(row[bucket_field])
+        if not difficulty_map:
+            raise ValueError(f"No difficulty rows loaded from {path}")
+        return difficulty_map
+
+    def _build_difficulty_buckets(self) -> dict[str, list[int]]:
+        labels = self._to_list(self.sampler_config.get("labels", None))
+        if labels is None:
+            labels = sorted(set(self.difficulty_map.values()), key=self._natural_sort_key)
+        labels = [str(label) for label in labels]
+
+        buckets = {label: [] for label in labels}
+        dataframe = getattr(self.data_source, "dataframe", None)
+        if dataframe is None:
+            raise ValueError("DifficultyBucketSampler needs data_source.dataframe")
+
+        missing = []
+        ignored = 0
+        for idx, row in enumerate(dataframe):
+            sample_index = str(self._get_nested_value(row, self.index_field))
+            bucket = self.difficulty_map.get(sample_index)
+            if bucket is None:
+                if self.missing_policy == "ignore":
+                    ignored += 1
+                    continue
+                if self.missing_policy == "bucket":
+                    if self.missing_bucket is None:
+                        raise ValueError("missing_policy=bucket requires data.sampler.missing_bucket")
+                    bucket = str(self.missing_bucket)
+                else:
+                    missing.append(sample_index)
+                    continue
+            if bucket not in buckets:
+                if self.sampler_config.get("allow_unconfigured_buckets", False):
+                    buckets[bucket] = []
+                    labels.append(bucket)
+                else:
+                    ignored += 1
+                    continue
+            buckets[bucket].append(idx)
+
+        if missing:
+            preview = ", ".join(missing[:10])
+            raise ValueError(
+                f"Difficulty file is missing {len(missing)} dataset samples for index_field={self.index_field!r}; "
+                f"first missing: {preview}. Use missing_policy=ignore or missing_policy=bucket if intended."
+            )
+        if ignored:
+            logger.warning("DifficultyBucketSampler ignored %s samples", ignored)
+
+        empty = [label for label, indices in buckets.items() if not indices]
+        if empty:
+            raise ValueError(f"No dataset samples found for difficulty buckets={empty}")
+        return buckets
+
+    @staticmethod
+    def _natural_sort_key(value: str) -> list[Any]:
+        return [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", value)]
