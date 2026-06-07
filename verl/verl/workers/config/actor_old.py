@@ -106,13 +106,6 @@ class ActorConfig(BaseConfig):
     clip_ratio_c: float = 3.0
     loss_agg_mode: str = "token-mean"
     entropy_coeff: float = 0
-    opd_enable: bool = False
-    opd_reason_coef: float = 0.0
-    opd_teacher_url: str = ""
-    opd_teacher_topk: int = 20
-    opd_teacher_batch_size: int = 1
-    opd_teacher_timeout: int = 600
-    opd_teacher_temperature: float = 1.0
     use_kl_loss: bool = False
     use_torch_compile: bool = True
     kl_loss_coef: float = 0.001

@@ -3,6 +3,7 @@ import json
 import multiprocessing as mp
 import os
 import re
+import signal
 import threading
 import time
 import traceback
@@ -49,6 +50,77 @@ ACTION_TIMEOUT_SEC = float(os.getenv("TEXT_BROWSER_ACTION_TIMEOUT_SEC", "75.0"))
 ENV_PROCESS_SHUTDOWN_TIMEOUT_SEC = float(
     os.getenv("TEXT_BROWSER_ENV_SHUTDOWN_TIMEOUT_SEC", "10.0")
 )
+
+
+def _get_child_pids(pid: int) -> List[int]:
+    child_pids = []
+    try:
+        proc_entries = os.listdir("/proc")
+    except Exception:
+        return child_pids
+
+    for entry in proc_entries:
+        if not entry.isdigit():
+            continue
+        stat_path = f"/proc/{entry}/stat"
+        try:
+            with open(stat_path, "r", encoding="utf-8") as handle:
+                stat = handle.read()
+            _, _, rest = stat.rpartition(")")
+            fields = rest.split()
+            if len(fields) >= 2 and int(fields[1]) == pid:
+                child_pids.append(int(entry))
+        except Exception:
+            continue
+    return child_pids
+
+
+def _collect_descendant_pids(pid: int) -> List[int]:
+    descendants = []
+    stack = [pid]
+    while stack:
+        current_pid = stack.pop()
+        children = _get_child_pids(current_pid)
+        descendants.extend(children)
+        stack.extend(children)
+    return descendants
+
+
+def _pid_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _terminate_process_tree(pid: int, timeout: float) -> None:
+    pids = _collect_descendant_pids(pid)
+    pids.append(pid)
+
+    for target_pid in reversed(pids):
+        try:
+            os.kill(target_pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except Exception as exc:
+            _debug(f"failed to SIGTERM pid={target_pid}: {exc}")
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not any(_pid_exists(target_pid) for target_pid in pids):
+            return
+        time.sleep(0.1)
+
+    for target_pid in reversed(pids):
+        try:
+            os.kill(target_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except Exception as exc:
+            _debug(f"failed to SIGKILL pid={target_pid}: {exc}")
 
 
 def _debug(message: str) -> None:
@@ -172,7 +244,10 @@ class _EnvProcessClient:
         if process is not None:
             try:
                 if process.is_alive():
-                    process.terminate()
+                    _terminate_process_tree(
+                        process.pid,
+                        max(1.0, ENV_PROCESS_SHUTDOWN_TIMEOUT_SEC / 2),
+                    )
                     process.join(timeout=ENV_PROCESS_SHUTDOWN_TIMEOUT_SEC)
                 if process.is_alive():
                     process.kill()

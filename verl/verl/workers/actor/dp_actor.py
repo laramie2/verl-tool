@@ -84,14 +84,18 @@ class DataParallelPPOActor(BasePPOActor):
         self.device_name = get_device_name()
 
     def _forward_micro_batch(
-        self, micro_batch, temperature, calculate_entropy=False
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self, micro_batch, temperature, calculate_entropy=False, return_selected_log_probs=False
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """
         Returns:
             entropy: # (bs, response_len)
             log_probs: # (bs, response_len)
+            selected_log_probs: # optional (bs, response_len, topk)
         """
         response_length = micro_batch["responses"].size(-1)
+        selected_token_ids = micro_batch.get("opd_teacher_topk_ids", None) if return_selected_log_probs else None
+        selected_reason_mask = micro_batch.get("opd_reason_mask", None) if return_selected_log_probs else None
+        selected_log_probs = None
         multi_modal_inputs = {}
         if "multi_modal_inputs" in micro_batch.keys():
             from verl.utils.model import extract_multi_modal_inputs
@@ -176,6 +180,7 @@ class DataParallelPPOActor(BasePPOActor):
                     **extra_args,
                 )  # prevent model thinks we are generating
 
+                selected_log_probs_rmpad = None
                 if self.use_fused_kernels:
                     log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
                     entropy_rmpad = output.entropy.squeeze(0)  # (total_nnz,)
@@ -185,7 +190,48 @@ class DataParallelPPOActor(BasePPOActor):
                     logits_rmpad.div_(temperature)
 
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
-                    inplace_backward = True
+                    if selected_token_ids is not None:
+                        if self.use_fused_kernels:
+                            raise NotImplementedError("OPD selected log-probs are not supported with fused kernels.")
+                        if self.use_ulysses_sp:
+                            raise NotImplementedError("OPD selected log-probs are not supported with Ulysses SP yet.")
+                        if selected_reason_mask is None:
+                            raise ValueError("opd_reason_mask is required when returning OPD selected log-probs.")
+
+                        topk = selected_token_ids.shape[-1]
+                        selected_log_probs_rmpad = torch.zeros(
+                            (logits_rmpad.shape[0], topk), dtype=torch.float32, device=logits_rmpad.device
+                        )
+                        reason_full = torch.zeros(
+                            (batch_size, seqlen),
+                            dtype=torch.bool,
+                            device=input_ids.device,
+                        )
+                        reason_full[:, -response_length - 1 : -1] = selected_reason_mask.to(
+                            input_ids.device, dtype=torch.bool
+                        )
+                        reason_rmpad = index_first_axis(
+                            rearrange(reason_full.unsqueeze(-1), "b s d -> (b s) d"), indices
+                        ).squeeze(-1).bool()
+
+                        if reason_rmpad.any():
+                            selected_full = torch.zeros(
+                                (batch_size, seqlen, topk),
+                                dtype=torch.long,
+                                device=input_ids.device,
+                            )
+                            selected_full[:, -response_length - 1 : -1, :] = selected_token_ids.to(input_ids.device)
+                            selected_rmpad = index_first_axis(
+                                rearrange(selected_full, "b s k -> (b s) k"), indices
+                            )
+                            reason_logits = logits_rmpad[reason_rmpad]
+                            reason_selected = selected_rmpad[reason_rmpad]
+                            reason_selected_logits = torch.gather(reason_logits, dim=-1, index=reason_selected)
+                            selected_log_probs_rmpad[reason_rmpad] = reason_selected_logits.float() - torch.logsumexp(
+                                reason_logits.float(), dim=-1, keepdim=True
+                            )
+
+                    inplace_backward = selected_token_ids is None
                     if calculate_entropy:
                         inplace_backward = False
                     log_probs = logprobs_from_logits(
@@ -233,6 +279,14 @@ class DataParallelPPOActor(BasePPOActor):
                     batch=batch_size,
                     seqlen=seqlen,
                 )
+                if selected_log_probs_rmpad is not None:
+                    full_selected_log_probs = pad_input(
+                        hidden_states=selected_log_probs_rmpad,
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    )
+                    selected_log_probs = full_selected_log_probs[:, -response_length - 1 : -1, :]
 
                 # only return response part:
                 if calculate_entropy:
@@ -263,13 +317,32 @@ class DataParallelPPOActor(BasePPOActor):
 
                     logits.div_(temperature)
                     logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
-                    log_probs = logprobs_from_logits(logits, micro_batch["responses"])
+                    if selected_token_ids is not None:
+                        if selected_reason_mask is None:
+                            raise ValueError("opd_reason_mask is required when returning OPD selected log-probs.")
+                        topk = selected_token_ids.shape[-1]
+                        selected_log_probs = torch.zeros(
+                            (batch_size, response_length, topk), dtype=torch.float32, device=logits.device
+                        )
+                        reason_mask = selected_reason_mask.to(logits.device, dtype=torch.bool)
+                        if reason_mask.any():
+                            reason_logits = logits[reason_mask]
+                            selected_ids = selected_token_ids.to(logits.device)[reason_mask]
+                            selected_logits = torch.gather(reason_logits, dim=-1, index=selected_ids)
+                            selected_log_probs[reason_mask] = selected_logits.float() - torch.logsumexp(
+                                reason_logits.float(), dim=-1, keepdim=True
+                            )
+                    log_probs = logprobs_from_logits(
+                        logits, micro_batch["responses"], inplace_backward=selected_token_ids is None
+                    )
                     if calculate_entropy:
                         if not self.config.entropy_checkpointing:
                             entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
                         else:
                             entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
 
+            if return_selected_log_probs:
+                return entropy, log_probs, selected_log_probs
             return entropy, log_probs
 
     def _optimizer_step(self):
@@ -377,6 +450,13 @@ class DataParallelPPOActor(BasePPOActor):
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
         if "rollout_is_weights" in data.batch.keys():
             select_keys.append("rollout_is_weights")
+        for optional_key in [
+            "opd_reason_mask",
+            "opd_teacher_topk_ids",
+            "opd_teacher_topk_logprobs",
+        ]:
+            if optional_key in data.batch.keys():
+                select_keys.append(optional_key)
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
@@ -430,9 +510,24 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy = False
                     if entropy_coeff != 0:
                         calculate_entropy = True
-                    entropy, log_prob = self._forward_micro_batch(
-                        model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                    return_selected_log_probs = (
+                        self.config.get("opd_enable", False)
+                        and "opd_teacher_topk_ids" in model_inputs
+                        and "opd_teacher_topk_logprobs" in model_inputs
+                        and "opd_reason_mask" in model_inputs
                     )
+                    if return_selected_log_probs:
+                        entropy, log_prob, opd_student_topk_log_prob = self._forward_micro_batch(
+                            model_inputs,
+                            temperature=temperature,
+                            calculate_entropy=calculate_entropy,
+                            return_selected_log_probs=True,
+                        )
+                    else:
+                        entropy, log_prob = self._forward_micro_batch(
+                            model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                        )
+                        opd_student_topk_log_prob = None
 
                     # for fully_async_policy recipe
                     if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
@@ -477,6 +572,29 @@ class DataParallelPPOActor(BasePPOActor):
                         policy_loss = pg_loss - entropy_loss * entropy_coeff
                     else:
                         policy_loss = pg_loss
+
+                    if opd_student_topk_log_prob is not None:
+                        opd_reason_coef = float(self.config.get("opd_reason_coef", 0.0))
+                        micro_batch_metrics["actor/opd_reason_loss"] = 0.0
+                        micro_batch_metrics["actor/opd_reason_coef"] = opd_reason_coef
+                        opd_mask = model_inputs["opd_reason_mask"].float() * response_mask.float()
+                        opd_token_count = opd_mask.sum()
+                        micro_batch_metrics["actor/opd_reason_tokens"] = opd_token_count.detach().item()
+                        if opd_token_count.item() > 0:
+                            teacher_topk_logprobs = model_inputs["opd_teacher_topk_logprobs"].to(
+                                opd_student_topk_log_prob.device
+                            ).float()
+                            teacher_probs = torch.softmax(teacher_topk_logprobs, dim=-1).detach()
+                            opd_loss_mat = -(teacher_probs * opd_student_topk_log_prob.float()).sum(dim=-1)
+                            opd_reason_loss = agg_loss(
+                                loss_mat=opd_loss_mat,
+                                loss_mask=opd_mask,
+                                loss_agg_mode=loss_agg_mode,
+                            )
+                            policy_loss = policy_loss + opd_reason_loss * opd_reason_coef
+                            micro_batch_metrics["actor/opd_reason_loss"] = (
+                                opd_reason_loss.detach().item() * loss_scale_factor
+                            )
 
                     if self.config.use_kl_loss:
                         ref_log_prob = model_inputs["ref_log_prob"]

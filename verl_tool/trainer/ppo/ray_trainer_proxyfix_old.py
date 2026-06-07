@@ -104,23 +104,8 @@ class AgentRayPPOTrainer(RayPPOTrainer):
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        with opener.open(request, timeout=timeout) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
-
-    @staticmethod
-    def _jsonify_opd_value(value):
-        if value is None:
-            return None
-        if isinstance(value, torch.Tensor):
-            return value.detach().cpu().tolist()
-        if isinstance(value, np.ndarray):
-            return value.tolist()
-        if isinstance(value, dict):
-            return {key: AgentRayPPOTrainer._jsonify_opd_value(val) for key, val in value.items()}
-        if isinstance(value, (list, tuple)):
-            return [AgentRayPPOTrainer._jsonify_opd_value(val) for val in value]
-        return value
 
     def _prepare_opd_reason_mask(self, batch: DataProto, metrics: dict) -> Optional[torch.Tensor]:
         response_mask = batch.batch["response_mask"].float()
@@ -173,7 +158,6 @@ class AgentRayPPOTrainer(RayPPOTrainer):
         all_topk_ids = []
         all_topk_logprobs = []
         endpoint = teacher_url.rstrip("/") + "/topk_logprobs"
-        multi_modal_inputs = batch.non_tensor_batch.get("multi_modal_inputs", None)
         num_requests = 0
         for start in range(0, input_ids.shape[0], teacher_batch_size):
             end = min(start + teacher_batch_size, input_ids.shape[0])
@@ -184,10 +168,6 @@ class AgentRayPPOTrainer(RayPPOTrainer):
                 "topk": topk,
                 "temperature": teacher_temperature,
             }
-            if multi_modal_inputs is not None:
-                payload["multi_modal_inputs"] = [
-                    self._jsonify_opd_value(item) for item in multi_modal_inputs[start:end]
-                ]
             result = self._post_json(endpoint, payload, timeout=timeout)
             all_topk_ids.append(torch.tensor(result["topk_ids"], dtype=torch.long))
             all_topk_logprobs.append(torch.tensor(result["topk_logprobs"], dtype=torch.float32))

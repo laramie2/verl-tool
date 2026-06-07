@@ -126,6 +126,8 @@ class AgentActorConfig:
     mask_void_traj: bool=False # whether to mask the void trajectory (no tool call and no final answer)
     logprobs: bool=False # whether to return logprobs for each generated token
     compact_tool_interact_info: bool=False # whether to keep only lightweight tool interaction info in training batches
+    opd_enable: bool=False # whether to emit step-level OPD metadata for teacher-forcing distillation
+    enable_obs_compression: bool=True # whether to render text observations into compressed images
     
 def sanitize_request(obj: Any) -> Any:
     """
@@ -457,6 +459,44 @@ class VerlToolAgentLoop(AgentLoopBase):
             epoch_name = str(epoch)
         prefix = "validation_epoch" if validate else "epoch"
         return os.path.join(log_dir, f"{prefix}_{epoch_name}.jsonl")
+
+    @classmethod
+    def _encode_no_special(cls, text: str) -> list[int]:
+        try:
+            return cls.tokenizer.encode(text, add_special_tokens=False)
+        except TypeError:
+            return cls.tokenizer.encode(text)
+
+    @classmethod
+    def _build_opd_reason_mask(cls, gen_text: str, target_len: int) -> list[int]:
+        mask = [0] * max(int(target_len), 0)
+        if target_len <= 0 or not gen_text:
+            return mask
+
+        spans = []
+        for match in re.finditer(r"<think>(.*?)</think>", gen_text, re.DOTALL):
+            spans.append((match.start(1), match.end(1)))
+
+        if not spans:
+            start = gen_text.find("<think>")
+            if start >= 0:
+                start += len("<think>")
+                end = gen_text.find("</think>", start)
+                if end < 0:
+                    fence = gen_text.find("```", start)
+                    end = fence if fence >= 0 else len(gen_text)
+                spans.append((start, end))
+
+        for start, end in spans:
+            if end <= start:
+                continue
+            start_idx = len(cls._encode_no_special(gen_text[:start]))
+            end_idx = len(cls._encode_no_special(gen_text[:end]))
+            start_idx = max(0, min(start_idx, len(mask)))
+            end_idx = max(start_idx, min(end_idx, len(mask)))
+            for token_idx in range(start_idx, end_idx):
+                mask[token_idx] = 1
+        return mask
 
     @staticmethod
     def _rollout_log_dir(config) -> str:
@@ -1273,7 +1313,9 @@ class VerlToolAgentLoop(AgentLoopBase):
             "tool_interact_info": [],
             "is_traj_finished": False,
             "valid_traj": 1,
-            "retokenization_diff": []
+            "retokenization_diff": [],
+            "opd_steps": [],
+            "opd_reason_mask": []
         }
 
         # ================= [新增模块: 初始化 Token 统计字典] =================
@@ -1573,6 +1615,8 @@ class VerlToolAgentLoop(AgentLoopBase):
                 else:
                     response_mask.extend([1] * len(obs_token_ids))
                 response_logprobs.extend([0.0] * len(obs_token_ids))
+                if self.agent_config.opd_enable and not kwargs.get("validate", False):
+                    stats_dict["opd_reason_mask"].extend([0] * len(obs_token_ids))
                 
                 if tool_results['done']:
                     stats_dict["is_traj_finished"] = True
@@ -1606,6 +1650,10 @@ class VerlToolAgentLoop(AgentLoopBase):
             gen_ids = output.token_ids
             gen_logprobs = output.log_probs or [0.0] * len(gen_ids)
             gen_text = output.text
+            response_offset_before_gen = len(response_mask)
+            gen_reason_mask = [0] * len(gen_ids)
+            if self.agent_config.opd_enable and not kwargs.get("validate", False):
+                gen_reason_mask = self._build_opd_reason_mask(gen_text, len(gen_ids))
 
             # ================= [新增模块: 统计模型生成 Token 花费] =================
             token_stats["total_gen_tokens"] += len(gen_ids)
@@ -1630,6 +1678,16 @@ class VerlToolAgentLoop(AgentLoopBase):
             running_prompt_ids.extend(gen_ids)
             response_mask.extend([1] * len(gen_ids))
             response_logprobs.extend(gen_logprobs)
+            if self.agent_config.opd_enable and not kwargs.get("validate", False):
+                stats_dict["opd_reason_mask"].extend(gen_reason_mask)
+                stats_dict["opd_steps"].append(
+                    {
+                        "turn": step,
+                        "response_start": response_offset_before_gen,
+                        "response_end": response_offset_before_gen + len(gen_ids),
+                        "reason_token_count": int(sum(gen_reason_mask)),
+                    }
+                )
             
             stats_dict["num_turns"] += 1
             stats_dict["action_lengths"].append(len(gen_ids))
@@ -1708,6 +1766,13 @@ class VerlToolAgentLoop(AgentLoopBase):
                     response_logprobs = response_logprobs[:mask_len_needed]
                 else:
                     response_logprobs.extend([0.0] * (mask_len_needed - len(response_logprobs)))
+                if self.agent_config.opd_enable and not kwargs.get("validate", False):
+                    if len(stats_dict["opd_reason_mask"]) > mask_len_needed:
+                        stats_dict["opd_reason_mask"] = stats_dict["opd_reason_mask"][:mask_len_needed]
+                    else:
+                        stats_dict["opd_reason_mask"].extend(
+                            [0] * (mask_len_needed - len(stats_dict["opd_reason_mask"]))
+                        )
         
         logger.debug(f"Trajectory {request_id} finished after {step} turns. Stop reason: {traj_stop_reason}")
         response_ids = running_prompt_ids[len(prompt_ids):]
@@ -1720,6 +1785,8 @@ class VerlToolAgentLoop(AgentLoopBase):
         
         if self.agent_config.mask_overlong_loss and not stats_dict["is_traj_finished"]:
             response_mask = [0] * len(response_mask)
+            if self.agent_config.opd_enable and not kwargs.get("validate", False):
+                stats_dict["opd_reason_mask"] = [0] * len(stats_dict["opd_reason_mask"])
             stats_dict["valid_traj"] = 0
             logger.info(f"Masking the whole response for traj_id={request_id} due to overlong trajectory and not finished.")
         
@@ -1728,6 +1795,8 @@ class VerlToolAgentLoop(AgentLoopBase):
             has_answer = "\\boxed" in response_text or "final_answer(" in response_text
             if stats_dict["valid_action"] == 0 and not has_answer:
                 response_mask = [0] * len(response_mask)
+                if self.agent_config.opd_enable and not kwargs.get("validate", False):
+                    stats_dict["opd_reason_mask"] = [0] * len(stats_dict["opd_reason_mask"])
                 stats_dict["valid_traj"] = 0
                 logger.info(f"Masking the whole response for traj_id={request_id} due to void trajectory (no valid action or no final answer). valid_action={stats_dict['valid_action']}, has_answer={has_answer}")
 
@@ -1739,6 +1808,8 @@ class VerlToolAgentLoop(AgentLoopBase):
                 response_ids.append(dummy_id)
                 response_mask.append(1)
                 response_logprobs.append(0.0)
+                if self.agent_config.opd_enable and not kwargs.get("validate", False):
+                    stats_dict["opd_reason_mask"].append(0)
             
         verl_tool_metrics = {
             "num_turns": stats_dict["num_turns"],
@@ -1791,6 +1862,12 @@ class VerlToolAgentLoop(AgentLoopBase):
             response_ids = response_ids[:cut_index]
             response_mask = response_mask[:cut_index]
             response_logprobs = response_logprobs[:cut_index]
+            if self.agent_config.opd_enable and not kwargs.get("validate", False):
+                stats_dict["opd_reason_mask"] = stats_dict["opd_reason_mask"][:cut_index]
+                for opd_step in stats_dict["opd_steps"]:
+                    opd_step["response_end"] = min(opd_step["response_end"], cut_index)
+                    if opd_step["response_start"] >= cut_index:
+                        opd_step["reason_token_count"] = 0
 
         if running_image_data is not None:
             full_ids = prompt_ids + response_ids
@@ -1851,6 +1928,26 @@ class VerlToolAgentLoop(AgentLoopBase):
         if self.agent_config.compact_tool_interact_info:
             tool_interact_info = compact_tool_interact_info_entries(tool_interact_info)
 
+        if self.agent_config.opd_enable and not kwargs.get("validate", False):
+            if len(stats_dict["opd_reason_mask"]) < len(response_ids):
+                stats_dict["opd_reason_mask"].extend([0] * (len(response_ids) - len(stats_dict["opd_reason_mask"])))
+            elif len(stats_dict["opd_reason_mask"]) > len(response_ids):
+                stats_dict["opd_reason_mask"] = stats_dict["opd_reason_mask"][: len(response_ids)]
+
+        output_extra_fields = {
+            "tool_interact_info": tool_interact_info,
+            "traj_stop_reason": traj_stop_reason,
+            "verl_tool_metrics": verl_tool_metrics,
+            "_rollout_log_info": {
+                "log_filename": log_filename,
+                "context": log_context,
+                "summary": trajectory_summary,
+            },
+        }
+        if self.agent_config.opd_enable and not kwargs.get("validate", False):
+            output_extra_fields["opd_steps"] = stats_dict["opd_steps"]
+            output_extra_fields["opd_reason_mask"] = stats_dict["opd_reason_mask"][: self.response_length]
+
         output = AgentLoopOutput(
             prompt_ids=prompt_ids,
             response_ids=response_ids[: self.response_length],
@@ -1859,15 +1956,6 @@ class VerlToolAgentLoop(AgentLoopBase):
             multi_modal_data=multi_modal_output,
             num_turns=stats_dict["num_turns"],
             metrics=metrics,
-            extra_fields={
-                "tool_interact_info": tool_interact_info,
-                "traj_stop_reason": traj_stop_reason,
-                "verl_tool_metrics": verl_tool_metrics,
-                "_rollout_log_info": {
-                    "log_filename": log_filename,
-                    "context": log_context,
-                    "summary": trajectory_summary,
-                },
-            },
+            extra_fields=output_extra_fields,
         )
         return output

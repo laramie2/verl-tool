@@ -93,119 +93,6 @@ class AgentRayPPOTrainer(RayPPOTrainer):
 
         return batch
 
-    @staticmethod
-    def _post_json(url: str, payload: dict, timeout: int) -> dict:
-        import urllib.request
-
-        data = json.dumps(payload).encode("utf-8")
-        request = urllib.request.Request(
-            url,
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        with opener.open(request, timeout=timeout) as response:
-            return json.loads(response.read().decode("utf-8"))
-
-    @staticmethod
-    def _jsonify_opd_value(value):
-        if value is None:
-            return None
-        if isinstance(value, torch.Tensor):
-            return value.detach().cpu().tolist()
-        if isinstance(value, np.ndarray):
-            return value.tolist()
-        if isinstance(value, dict):
-            return {key: AgentRayPPOTrainer._jsonify_opd_value(val) for key, val in value.items()}
-        if isinstance(value, (list, tuple)):
-            return [AgentRayPPOTrainer._jsonify_opd_value(val) for val in value]
-        return value
-
-    def _prepare_opd_reason_mask(self, batch: DataProto, metrics: dict) -> Optional[torch.Tensor]:
-        response_mask = batch.batch["response_mask"].float()
-        bsz, response_len = response_mask.shape
-        reason_mask = torch.zeros((bsz, response_len), dtype=torch.float32)
-
-        raw_masks = batch.non_tensor_batch.get("opd_reason_mask", None)
-        if raw_masks is None:
-            metrics["actor/opd_reason_tokens"] = 0.0
-            return None
-
-        for row_idx, raw_mask in enumerate(raw_masks):
-            if raw_mask is None:
-                continue
-            if isinstance(raw_mask, np.ndarray):
-                raw_mask = raw_mask.tolist()
-            raw_mask = list(raw_mask)
-            keep_len = min(len(raw_mask), response_len)
-            if keep_len > 0:
-                reason_mask[row_idx, :keep_len] = torch.tensor(raw_mask[:keep_len], dtype=torch.float32)
-
-        reason_mask = reason_mask * response_mask.cpu()
-        metrics["actor/opd_reason_tokens"] = float(reason_mask.sum().item())
-        if reason_mask.sum().item() <= 0:
-            return None
-        return reason_mask
-
-    def _attach_opd_teacher_logits(self, batch: DataProto, metrics: dict) -> DataProto:
-        actor_cfg = self.config.actor_rollout_ref.actor
-        if not actor_cfg.get("opd_enable", False):
-            return batch
-
-        reason_mask = self._prepare_opd_reason_mask(batch, metrics)
-        if reason_mask is None:
-            metrics["actor/opd_teacher/requests"] = 0.0
-            return batch
-
-        teacher_url = actor_cfg.get("opd_teacher_url", "")
-        if not teacher_url:
-            raise ValueError("actor_rollout_ref.actor.opd_teacher_url must be set when opd_enable=True")
-
-        input_ids = batch.batch["input_ids"].cpu()
-        attention_mask = batch.batch["attention_mask"].cpu()
-        response_len = int(batch.batch["responses"].shape[1])
-        topk = int(actor_cfg.get("opd_teacher_topk", 20))
-        teacher_batch_size = max(int(actor_cfg.get("opd_teacher_batch_size", 1)), 1)
-        timeout = int(actor_cfg.get("opd_teacher_timeout", 600))
-        teacher_temperature = float(actor_cfg.get("opd_teacher_temperature", 1.0))
-
-        all_topk_ids = []
-        all_topk_logprobs = []
-        endpoint = teacher_url.rstrip("/") + "/topk_logprobs"
-        multi_modal_inputs = batch.non_tensor_batch.get("multi_modal_inputs", None)
-        num_requests = 0
-        for start in range(0, input_ids.shape[0], teacher_batch_size):
-            end = min(start + teacher_batch_size, input_ids.shape[0])
-            payload = {
-                "input_ids": input_ids[start:end].tolist(),
-                "attention_mask": attention_mask[start:end].tolist(),
-                "response_length": response_len,
-                "topk": topk,
-                "temperature": teacher_temperature,
-            }
-            if multi_modal_inputs is not None:
-                payload["multi_modal_inputs"] = [
-                    self._jsonify_opd_value(item) for item in multi_modal_inputs[start:end]
-                ]
-            result = self._post_json(endpoint, payload, timeout=timeout)
-            all_topk_ids.append(torch.tensor(result["topk_ids"], dtype=torch.long))
-            all_topk_logprobs.append(torch.tensor(result["topk_logprobs"], dtype=torch.float32))
-            num_requests += 1
-
-        teacher_topk_ids = torch.cat(all_topk_ids, dim=0)
-        teacher_topk_logprobs = torch.cat(all_topk_logprobs, dim=0)
-        expected_shape = (input_ids.shape[0], response_len, topk)
-        if tuple(teacher_topk_ids.shape) != expected_shape:
-            raise ValueError(f"Unexpected OPD teacher topk shape: {tuple(teacher_topk_ids.shape)} != {expected_shape}")
-
-        batch.batch["opd_reason_mask"] = reason_mask.to(batch.batch["response_mask"].device)
-        batch.batch["opd_teacher_topk_ids"] = teacher_topk_ids.to(batch.batch["responses"].device)
-        batch.batch["opd_teacher_topk_logprobs"] = teacher_topk_logprobs.to(batch.batch["response_mask"].device)
-        metrics["actor/opd_teacher/requests"] = float(num_requests)
-        metrics["actor/opd_teacher/topk"] = float(topk)
-        return batch
-
     def _filter_and_accumulate_dapo_batch(
         self,
         new_batch: DataProto,
@@ -451,10 +338,6 @@ class AgentRayPPOTrainer(RayPPOTrainer):
 
                     if not self.config.algorithm.use_kl_in_reward:
                         batch = self._compute_kl_related_metrics(batch, metrics, timing_raw)
-
-                    if self.config.actor_rollout_ref.actor.get("opd_enable", False):
-                        with marked_timer("opd_teacher", timing_raw, color="orange"):
-                            batch = self._attach_opd_teacher_logits(batch, metrics)
 
                     model_forward_batch = self._select_model_forward_batch(batch)
 
