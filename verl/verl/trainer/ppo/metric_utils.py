@@ -77,6 +77,94 @@ def _compute_response_info(batch: DataProto) -> dict[str, Any]:
     )
 
 
+def _get_curriculum_difficulties(batch: DataProto, batch_size: int) -> list[str | None]:
+    """Best-effort extraction of per-sample curriculum difficulty labels."""
+    if "curriculum_difficulty" in batch.non_tensor_batch:
+        values = batch.non_tensor_batch["curriculum_difficulty"]
+        return [str(v) if v is not None else None for v in values]
+
+    extra_infos = batch.non_tensor_batch.get("extra_info", None)
+    if extra_infos is None:
+        return [None] * batch_size
+
+    labels: list[str | None] = []
+    for item in extra_infos:
+        label = None
+        if isinstance(item, dict):
+            label = item.get("curriculum_difficulty") or item.get("difficulty")
+        labels.append(str(label) if label is not None else None)
+    if len(labels) != batch_size:
+        return [None] * batch_size
+    return labels
+
+
+def _compute_group_reward_metrics(
+    batch: DataProto,
+    sequence_reward: torch.Tensor,
+    valid_eps: float = 1e-6,
+    high_threshold: float = 0.5,
+    low_threshold: float = 0.100001,
+) -> dict[str, Any]:
+    """Compute prompt-group reward diagnostics for GRPO-style n-rollout batches."""
+    uids = batch.non_tensor_batch.get("uid", None)
+    if uids is None or len(uids) != sequence_reward.shape[0]:
+        return {}
+
+    rewards = sequence_reward.detach().float().cpu()
+    difficulties = _get_curriculum_difficulties(batch, rewards.numel())
+
+    group_indices: dict[str, list[int]] = defaultdict(list)
+    group_difficulty: dict[str, str | None] = {}
+    for i, uid in enumerate(uids):
+        uid = str(uid)
+        group_indices[uid].append(i)
+        if uid not in group_difficulty:
+            group_difficulty[uid] = difficulties[i]
+
+    if not group_indices:
+        return {}
+
+    group_stds = []
+    valid_groups = 0
+    all_correct = 0
+    all_wrong = 0
+    by_difficulty_groups: dict[str, list[float]] = defaultdict(list)
+    by_difficulty_valid: dict[str, list[float]] = defaultdict(list)
+
+    for uid, indices in group_indices.items():
+        group_rewards = rewards[indices]
+        group_std = torch.std(group_rewards, unbiased=False) if group_rewards.numel() > 1 else torch.tensor(0.0)
+        group_std_value = float(group_std.item())
+        group_stds.append(group_std_value)
+
+        is_valid = group_std_value > valid_eps
+        valid_groups += int(is_valid)
+        all_correct += int(bool(torch.all(group_rewards >= high_threshold).item()))
+        all_wrong += int(bool(torch.all(group_rewards <= low_threshold).item()))
+
+        difficulty = group_difficulty.get(uid)
+        if difficulty:
+            by_difficulty_groups[difficulty].extend(float(v) for v in group_rewards.tolist())
+            by_difficulty_valid[difficulty].append(float(is_valid))
+
+    num_groups = len(group_indices)
+    metrics = {
+        "reward_group/group_reward_std_mean": float(np.mean(group_stds)),
+        "reward_group/valid_group_ratio": valid_groups / num_groups,
+        "reward_group/all_correct_ratio": all_correct / num_groups,
+        "reward_group/all_wrong_ratio": all_wrong / num_groups,
+    }
+
+    for difficulty, values in by_difficulty_groups.items():
+        if values:
+            metrics[f"difficulty/{difficulty}/reward_mean"] = float(np.mean(values))
+    for difficulty, values in by_difficulty_valid.items():
+        if values:
+            metrics[f"difficulty/{difficulty}/valid_group_ratio"] = float(np.mean(values))
+
+    return metrics
+
+
 def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str, Any]:
     """
     Computes various metrics from a batch of data for PPO training.
@@ -207,6 +295,8 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "prompt_length/min": torch.min(prompt_length).detach().item(),
         "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
     }
+
+    metrics.update(_compute_group_reward_metrics(batch, sequence_reward))
 
     # multi-turn conversation
     if "__num_turns__" in batch.non_tensor_batch:
