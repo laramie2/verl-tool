@@ -427,6 +427,75 @@ class AgentLoopWorker:
         run_time_context = ray.get_runtime_context()
         self.name = run_time_context.get_actor_name() or "unnamed"
 
+    @staticmethod
+    def _jsonify_opd_value(value):
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu().tolist()
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, dict):
+            return {key: AgentLoopWorker._jsonify_opd_value(val) for key, val in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [AgentLoopWorker._jsonify_opd_value(val) for val in value]
+        return value
+
+    def _submit_opd_teacher_job(
+        self,
+        *,
+        request_id: str,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        response_length: int,
+        reason_mask: Any,
+        multi_modal_inputs: Optional[dict[str, torch.Tensor]],
+    ) -> bool:
+        actor_cfg = self.config.actor_rollout_ref.actor
+        if not actor_cfg.get("opd_enable", False):
+            return False
+        teacher_url = actor_cfg.get("opd_teacher_url", "")
+        if not teacher_url:
+            return False
+        if reason_mask is None:
+            return False
+        if isinstance(reason_mask, np.ndarray):
+            reason_mask = reason_mask.tolist()
+        reason_mask = list(reason_mask)
+        if not any(float(v) > 0 for v in reason_mask):
+            return False
+
+        import json
+        import urllib.request
+
+        payload = {
+            "request_id": request_id,
+            "input_ids": [input_ids.squeeze(0).detach().cpu().tolist()],
+            "attention_mask": [attention_mask.squeeze(0).detach().cpu().tolist()],
+            "response_length": int(response_length),
+            "topk": int(actor_cfg.get("opd_teacher_topk", 20)),
+            "temperature": float(actor_cfg.get("opd_teacher_temperature", 1.0)),
+            "reason_mask": [reason_mask[: int(response_length)]],
+        }
+        if multi_modal_inputs is not None:
+            payload["multi_modal_inputs"] = [self._jsonify_opd_value(multi_modal_inputs)]
+
+        submit_url = teacher_url.rstrip("/") + "/submit_topk_logprobs"
+        data = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            submit_url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(request, timeout=10) as response:
+                return response.status == 200
+        except Exception as exc:
+            logger.warning(f"Failed to submit OPD teacher job {request_id}: {exc}")
+            return False
+
     async def generate_sequences(self, batch: DataProto) -> DataProto:
         """Generate sequences from agent loop.
 
@@ -720,6 +789,18 @@ class AgentLoopWorker:
                 except Exception as e:
                     logger.warning(f"Failed to append rollout trajectory_summary: {e}")
                 
+            if self.config.actor_rollout_ref.actor.get("opd_enable", False) and not trajectory["validate"]:
+                opd_traj_id = output.extra_fields.get("opd_traj_id") or str(uuid.uuid4())
+                output.extra_fields["opd_traj_id"] = opd_traj_id
+                output.extra_fields["opd_teacher_submitted"] = self._submit_opd_teacher_job(
+                    request_id=opd_traj_id,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    response_length=self.config.actor_rollout_ref.rollout.response_length,
+                    reason_mask=output.extra_fields.get("opd_reason_mask"),
+                    multi_modal_inputs=multi_modal_inputs,
+                )
+
             return _InternalAgentLoopOutput(
                 prompt_ids=prompt_output["input_ids"],
                 response_ids=response_output["input_ids"],

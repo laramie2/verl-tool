@@ -1,4 +1,8 @@
 import argparse
+import queue
+import threading
+import time
+import uuid
 from typing import Any
 
 import torch
@@ -8,12 +12,19 @@ from pydantic import BaseModel
 
 
 class TopKLogprobsRequest(BaseModel):
+    request_id: str | None = None
     input_ids: list[list[int]]
     attention_mask: list[list[int]] | None = None
     response_length: int
     topk: int | None = None
     temperature: float = 1.0
     multi_modal_inputs: list[dict[str, Any] | None] | None = None
+    reason_mask: list[list[int] | list[float]] | list[int] | list[float] | None = None
+
+
+class FetchTopKLogprobsRequest(BaseModel):
+    request_ids: list[str]
+    pop: bool = False
 
 
 class TeacherEngine:
@@ -115,16 +126,110 @@ class TeacherEngine:
         }
 
 
+class AsyncTeacherQueue:
+    def __init__(self, engine: TeacherEngine, max_results: int = 4096, result_ttl_sec: int = 7200):
+        self.engine = engine
+        self.max_results = int(max_results)
+        self.result_ttl_sec = int(result_ttl_sec)
+        self.jobs: queue.Queue[tuple[str, TopKLogprobsRequest]] = queue.Queue()
+        self.results: dict[str, dict[str, Any]] = {}
+        self.lock = threading.Lock()
+        self.worker = threading.Thread(target=self._worker_loop, name="opd-teacher-worker", daemon=True)
+        self.worker.start()
+
+    def submit(self, request: TopKLogprobsRequest) -> str:
+        request_id = request.request_id or str(uuid.uuid4())
+        request.request_id = request_id
+        now = time.time()
+        with self.lock:
+            self.results[request_id] = {"status": "queued", "created_at": now, "updated_at": now}
+            self._prune_locked(now)
+        self.jobs.put((request_id, request))
+        return request_id
+
+    def fetch(self, request_ids: list[str], pop: bool = False) -> dict[str, Any]:
+        now = time.time()
+        records = {}
+        with self.lock:
+            self._prune_locked(now)
+            for request_id in request_ids:
+                record = self.results.get(request_id)
+                if record is None:
+                    records[request_id] = {"status": "missing"}
+                    continue
+                records[request_id] = dict(record)
+                if pop and record.get("status") in {"done", "error"}:
+                    self.results.pop(request_id, None)
+        return {"results": records, "queue_size": self.jobs.qsize()}
+
+    def _worker_loop(self):
+        while True:
+            request_id, request = self.jobs.get()
+            with self.lock:
+                if request_id in self.results:
+                    self.results[request_id].update({"status": "running", "updated_at": time.time()})
+            try:
+                result = self.engine.topk_logprobs(request)
+                with self.lock:
+                    self.results[request_id] = {
+                        "status": "done",
+                        "result": result,
+                        "created_at": self.results.get(request_id, {}).get("created_at", time.time()),
+                        "updated_at": time.time(),
+                    }
+            except Exception as exc:
+                with self.lock:
+                    self.results[request_id] = {
+                        "status": "error",
+                        "error": repr(exc),
+                        "created_at": self.results.get(request_id, {}).get("created_at", time.time()),
+                        "updated_at": time.time(),
+                    }
+            finally:
+                self.jobs.task_done()
+
+    def _prune_locked(self, now: float):
+        if self.result_ttl_sec > 0:
+            expired = [
+                request_id
+                for request_id, record in self.results.items()
+                if record.get("status") in {"done", "error", "missing"}
+                and now - float(record.get("updated_at", now)) > self.result_ttl_sec
+            ]
+            for request_id in expired:
+                self.results.pop(request_id, None)
+
+        if self.max_results > 0 and len(self.results) > self.max_results:
+            removable = [
+                (record.get("updated_at", 0.0), request_id)
+                for request_id, record in self.results.items()
+                if record.get("status") in {"done", "error"}
+            ]
+            removable.sort()
+            for _, request_id in removable[: max(len(self.results) - self.max_results, 0)]:
+                self.results.pop(request_id, None)
+
+
 def build_app(engine: TeacherEngine) -> FastAPI:
     app = FastAPI()
+    async_queue = AsyncTeacherQueue(engine)
 
     @app.get("/health")
     def health():
-        return {"status": "ok"}
+        return {"status": "ok", "queue_size": async_queue.jobs.qsize()}
 
     @app.post("/topk_logprobs")
     def topk_logprobs(request: TopKLogprobsRequest):
         return engine.topk_logprobs(request)
+
+    @app.post("/submit_topk_logprobs")
+    def submit_topk_logprobs(request: TopKLogprobsRequest):
+        request_id = async_queue.submit(request)
+        return {"request_id": request_id, "status": "queued", "queue_size": async_queue.jobs.qsize()}
+
+    @app.post("/fetch_topk_logprobs")
+    def fetch_topk_logprobs(request: FetchTopKLogprobsRequest):
+        return async_queue.fetch(request.request_ids, pop=request.pop)
 
     return app
 

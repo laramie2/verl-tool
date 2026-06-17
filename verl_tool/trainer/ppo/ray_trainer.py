@@ -3,6 +3,7 @@ import uuid
 import torch
 import os
 import json
+import time
 import numpy as np
 from copy import deepcopy
 from collections import defaultdict
@@ -204,6 +205,132 @@ class AgentRayPPOTrainer(RayPPOTrainer):
         batch.batch["opd_teacher_topk_logprobs"] = teacher_topk_logprobs.to(batch.batch["response_mask"].device)
         metrics["actor/opd_teacher/requests"] = float(num_requests)
         metrics["actor/opd_teacher/topk"] = float(topk)
+        return batch
+
+    def _collect_opd_teacher_logits_or_fallback(self, batch: DataProto, metrics: dict) -> DataProto:
+        actor_cfg = self.config.actor_rollout_ref.actor
+        if not actor_cfg.get("opd_enable", False):
+            return batch
+
+        reason_mask = self._prepare_opd_reason_mask(batch, metrics)
+        if reason_mask is None:
+            metrics["actor/opd_teacher/requests"] = 0.0
+            return batch
+
+        teacher_url = actor_cfg.get("opd_teacher_url", "")
+        if not teacher_url:
+            raise ValueError("actor_rollout_ref.actor.opd_teacher_url must be set when opd_enable=True")
+
+        traj_ids = batch.non_tensor_batch.get("opd_traj_id", None)
+        submitted = batch.non_tensor_batch.get("opd_teacher_submitted", None)
+
+        response_len = int(batch.batch["responses"].shape[1])
+        topk = int(actor_cfg.get("opd_teacher_topk", 20))
+        teacher_temperature = float(actor_cfg.get("opd_teacher_temperature", 1.0))
+        submit_endpoint = teacher_url.rstrip("/") + "/submit_topk_logprobs"
+        input_ids = batch.batch["input_ids"].cpu()
+        attention_mask = batch.batch["attention_mask"].cpu()
+        multi_modal_inputs = batch.non_tensor_batch.get("multi_modal_inputs", None)
+
+        def submit_row(idx: int, request_id: str):
+            payload = {
+                "request_id": request_id,
+                "input_ids": [input_ids[idx].tolist()],
+                "attention_mask": [attention_mask[idx].tolist()],
+                "response_length": response_len,
+                "topk": topk,
+                "temperature": teacher_temperature,
+                "reason_mask": [reason_mask[idx].cpu().tolist()],
+            }
+            if multi_modal_inputs is not None:
+                payload["multi_modal_inputs"] = [self._jsonify_opd_value(multi_modal_inputs[idx])]
+            self._post_json(submit_endpoint, payload, timeout=10)
+
+        active_rows = [idx for idx in range(reason_mask.shape[0]) if reason_mask[idx].sum().item() > 0]
+        request_ids: list[str] = []
+        row_by_request_id: dict[str, int] = {}
+        late_submits = 0
+        for idx in active_rows:
+            request_id = str(traj_ids[idx]) if traj_ids is not None and traj_ids[idx] is not None else str(uuid.uuid4())
+            is_submitted = bool(submitted[idx]) if submitted is not None and submitted[idx] is not None else False
+            if not is_submitted:
+                submit_row(idx, request_id)
+                late_submits += 1
+            request_ids.append(request_id)
+            row_by_request_id[request_id] = idx
+
+        metrics["actor/opd_teacher/late_submits"] = float(late_submits)
+        if not request_ids:
+            batch.batch["opd_reason_mask"] = reason_mask.to(batch.batch["response_mask"].device)
+            batch.batch["opd_teacher_topk_ids"] = torch.zeros(
+                (len(batch), response_len, topk), dtype=torch.long, device=batch.batch["responses"].device
+            )
+            batch.batch["opd_teacher_topk_logprobs"] = torch.zeros(
+                (len(batch), response_len, topk), dtype=torch.float32, device=batch.batch["response_mask"].device
+            )
+            metrics["actor/opd_teacher/requests"] = 0.0
+            metrics["actor/opd_teacher/topk"] = float(topk)
+            return batch
+
+        endpoint = teacher_url.rstrip("/") + "/fetch_topk_logprobs"
+        per_request_timeout = int(actor_cfg.get("opd_teacher_timeout", 600))
+        collect_timeout = max(per_request_timeout, per_request_timeout * max(len(request_ids), 1))
+        poll_interval = float(actor_cfg.get("opd_teacher_poll_interval", 2.0))
+        deadline = time.monotonic() + collect_timeout
+        pending = set(request_ids)
+        ready: dict[str, dict] = {}
+
+        while pending:
+            result = self._post_json(
+                endpoint,
+                {"request_ids": sorted(pending), "pop": False},
+                timeout=min(max(per_request_timeout, 1), 60),
+            )
+            records = result.get("results", {})
+            for request_id, record in records.items():
+                status = record.get("status")
+                if status == "done":
+                    ready[request_id] = record["result"]
+                    pending.discard(request_id)
+                elif status == "error":
+                    raise RuntimeError(f"OPD teacher job {request_id} failed: {record.get('error')}")
+                elif status == "missing":
+                    row_idx = row_by_request_id.get(request_id)
+                    if row_idx is None:
+                        raise RuntimeError(f"OPD teacher job {request_id} is missing and cannot be resubmitted")
+                    submit_row(row_idx, request_id)
+                    metrics["actor/opd_teacher/resubmits"] = metrics.get("actor/opd_teacher/resubmits", 0.0) + 1.0
+
+            if pending:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"Timed out waiting for {len(pending)} OPD teacher jobs")
+                time.sleep(poll_interval)
+
+        self._post_json(endpoint, {"request_ids": request_ids, "pop": True}, timeout=min(max(per_request_timeout, 1), 60))
+
+        teacher_topk_ids = torch.zeros((len(batch), response_len, topk), dtype=torch.long)
+        teacher_topk_logprobs = torch.zeros((len(batch), response_len, topk), dtype=torch.float32)
+        for request_id, teacher_result in ready.items():
+            row_idx = row_by_request_id[request_id]
+            row_topk_ids = torch.tensor(teacher_result["topk_ids"], dtype=torch.long)
+            row_topk_logprobs = torch.tensor(teacher_result["topk_logprobs"], dtype=torch.float32)
+            if row_topk_ids.dim() == 3:
+                row_topk_ids = row_topk_ids.squeeze(0)
+            if row_topk_logprobs.dim() == 3:
+                row_topk_logprobs = row_topk_logprobs.squeeze(0)
+            expected = (response_len, topk)
+            if tuple(row_topk_ids.shape) != expected:
+                raise ValueError(f"Unexpected OPD teacher topk shape for {request_id}: {tuple(row_topk_ids.shape)} != {expected}")
+            teacher_topk_ids[row_idx] = row_topk_ids
+            teacher_topk_logprobs[row_idx] = row_topk_logprobs
+
+        batch.batch["opd_reason_mask"] = reason_mask.to(batch.batch["response_mask"].device)
+        batch.batch["opd_teacher_topk_ids"] = teacher_topk_ids.to(batch.batch["responses"].device)
+        batch.batch["opd_teacher_topk_logprobs"] = teacher_topk_logprobs.to(batch.batch["response_mask"].device)
+        metrics["actor/opd_teacher/requests"] = float(len(request_ids))
+        metrics["actor/opd_teacher/topk"] = float(topk)
+        metrics["actor/opd_teacher/fallback_sync"] = 0.0
+        metrics["actor/opd_teacher/pending_after_collect"] = 0.0
         return batch
 
     def _filter_and_accumulate_dapo_batch(
@@ -452,10 +579,6 @@ class AgentRayPPOTrainer(RayPPOTrainer):
                     if not self.config.algorithm.use_kl_in_reward:
                         batch = self._compute_kl_related_metrics(batch, metrics, timing_raw)
 
-                    if self.config.actor_rollout_ref.actor.get("opd_enable", False):
-                        with marked_timer("opd_teacher", timing_raw, color="orange"):
-                            batch = self._attach_opd_teacher_logits(batch, metrics)
-
                     model_forward_batch = self._select_model_forward_batch(batch)
 
                     if self.use_critic:
@@ -485,6 +608,10 @@ class AgentRayPPOTrainer(RayPPOTrainer):
                         metrics.update(critic_output_metrics)
 
                     if self.config.trainer.critic_warmup <= self.global_steps:
+                        if self.config.actor_rollout_ref.actor.get("opd_enable", False):
+                            with marked_timer("opd_teacher_wait", timing_raw, color="orange"):
+                                batch = self._collect_opd_teacher_logits_or_fallback(batch, metrics)
+
                         with marked_timer("update_actor", timing_raw, color="red"):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                             actor_output = self.actor_rollout_wg.update_actor(batch)
