@@ -845,6 +845,105 @@ def _compute_turn_reward_from_tool_info(tool_interact_info: list[dict]) -> float
     return 0.3 * (successful / total_valid) + 0.05 * successful
 
 
+
+def _coerce_python_list(value):
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    return value
+
+
+def _extract_turn_reward_records(turn_reward_item: Any, tool_info_item: Any = None) -> list[dict[str, Any]]:
+    """Normalize BrowserAgent dense turn rewards and legacy scalar rewards."""
+    item = _coerce_python_list(turn_reward_item)
+    records = None
+
+    if isinstance(item, dict):
+        records = item.get("turns", [])
+    elif isinstance(item, (list, tuple)) and all(isinstance(x, dict) for x in item):
+        records = list(item)
+    elif item is not None:
+        try:
+            scalar_reward = float(item)
+        except (TypeError, ValueError):
+            scalar_reward = 0.0
+        return [
+            {
+                "turn": 0,
+                "reward": scalar_reward,
+                "response_start": -1,
+                "response_end": -1,
+            }
+        ]
+    elif tool_info_item:
+        scalar_reward = _compute_turn_reward_from_tool_info(_coerce_python_list(tool_info_item))
+        return [
+            {
+                "turn": 0,
+                "reward": scalar_reward,
+                "response_start": -1,
+                "response_end": -1,
+            }
+        ]
+
+    normalized = []
+    for ordinal, record in enumerate(records or []):
+        if not isinstance(record, dict):
+            continue
+        try:
+            reward = float(record.get("reward", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            reward = 0.0
+        turn = record.get("turn", ordinal)
+        if not isinstance(turn, (int, np.integer)):
+            turn = ordinal
+        start = record.get("response_start", -1)
+        end = record.get("response_end", -1)
+        normalized.append(
+            {
+                "turn": int(turn),
+                "reward": reward,
+                "response_start": int(start) if isinstance(start, (int, np.integer)) else -1,
+                "response_end": int(end) if isinstance(end, (int, np.integer)) else -1,
+            }
+        )
+    return normalized
+
+
+def _normalize_sparse_turn_rewards(
+    turn_records_by_sample: list[list[dict[str, Any]]],
+    index: np.ndarray,
+    device: torch.device,
+    epsilon: float,
+) -> list[dict[int, torch.Tensor]]:
+    """GRPO-normalize rewards within each uid and turn ordinal."""
+    advantages_by_sample: list[dict[int, torch.Tensor]] = [{} for _ in turn_records_by_sample]
+    id2indices = defaultdict(list)
+    for i, idx in enumerate(index):
+        id2indices[idx].append(i)
+
+    for _, indices in id2indices.items():
+        turns = sorted({record["turn"] for i in indices for record in turn_records_by_sample[i]})
+        for turn in turns:
+            rewards = []
+            present_positions = []
+            for position, sample_idx in enumerate(indices):
+                matching = [record["reward"] for record in turn_records_by_sample[sample_idx] if record["turn"] == turn]
+                rewards.append(float(sum(matching)) if matching else 0.0)
+                if matching:
+                    present_positions.append((sample_idx, position))
+            rewards_t = torch.tensor(rewards, dtype=torch.float32, device=device)
+            mean = rewards_t.mean()
+            if len(indices) == 1:
+                adv_t = torch.zeros_like(rewards_t)
+            else:
+                std = rewards_t.std()
+                adv_t = rewards_t - mean if std < epsilon else (rewards_t - mean) / (std + epsilon)
+            for sample_idx, position in present_positions:
+                advantages_by_sample[sample_idx][turn] = adv_t[position]
+
+    return advantages_by_sample
+
+
 def _find_result_segment(tool_interact_info: Optional[list[dict]], result_tag: str = "<result>") -> int:
     """
     Find the segment index containing the first <result> tag.
@@ -915,120 +1014,78 @@ def compute_mt_grpo_outcome_advantage(
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Compute MT-GRPO advantage with turn-level credit assignment.
+    Compute MT-GRPO advantages with optional span-aware turn rewards.
 
-    Core formula:
-    - Before <result>: advantage = outcome_adv + turn_coef * turn_adv
-    - After <result>: advantage = outcome_adv only
-
-    This enables fine-grained credit assignment for multi-turn agent training,
-    where intermediate tool-calling actions receive turn-level rewards.
-
-    Reference: Multi-Turn-RL-Agent (arXiv:2505.11821)
-
-    Args:
-        token_level_rewards: `(torch.Tensor)`
-            shape: (bs, response_length)
-        response_mask: `(torch.Tensor)`
-            shape: (bs, response_length)
-        index: `(np.ndarray)`
-            shape: (bs,) - group indices (uid)
-        epsilon: `(float)`
-            small value for numerical stability
-        norm_adv_by_std_in_grpo: `(bool)`
-            whether to normalize by std (default False for MT-GRPO)
-        config: `(Optional[AlgoConfig])`
-            algorithm configuration
-        turn_reward: `(Optional[np.ndarray])`
-            pre-computed turn rewards, shape (bs,)
-        tool_interact_info: `(Optional[list])`
-            list of tool interaction info for computing turn_reward if not provided
-        turn_advantage_coef: `(float)`
-            coefficient for turn advantage (default 1.0)
-
-    Returns:
-        advantages: `(torch.Tensor)`
-            shape: (bs, response_length)
-        returns: `(torch.Tensor)`
-            shape: (bs, response_length)
+    BrowserAgent can pass turn_reward as:
+    - legacy scalar per sample: applied before the first result segment;
+    - {"turns": [{turn, reward, response_start, response_end}, ...]} per sample:
+      normalized by (uid, turn) and applied only to the recorded assistant span.
     """
     device = response_mask.device
     batch_size, seq_len = response_mask.shape
 
-    # Get turn_advantage_coef from config if available
     turn_coef = turn_advantage_coef
     if config is not None:
         turn_coef = config.get("turn_advantage_coef", turn_coef)
 
     with torch.no_grad():
-        # 1. Compute outcome rewards (sum of token-level rewards)
         outcome_rewards = token_level_rewards.sum(dim=-1)
+        outcome_adv = _mt_grpo_normalize(outcome_rewards, index, epsilon)
+        advantages = outcome_adv.unsqueeze(-1).expand(-1, seq_len) * response_mask.float()
 
-        # 2. Get or compute turn rewards
-        if turn_reward is not None:
-            if isinstance(turn_reward, np.ndarray):
-                turn_rewards = torch.tensor(turn_reward, dtype=torch.float32, device=device)
-            else:
-                turn_rewards = torch.tensor(list(turn_reward), dtype=torch.float32, device=device)
-        elif tool_interact_info is not None:
-            turn_rewards_list = []
-            for i in range(batch_size):
-                info_i = tool_interact_info[i] if i < len(tool_interact_info) else None
-                turn_r = _compute_turn_reward_from_tool_info(info_i) if info_i else 0.0
-                turn_rewards_list.append(turn_r)
-            turn_rewards = torch.tensor(turn_rewards_list, dtype=torch.float32, device=device)
-        else:
-            # Fallback to standard GRPO (no turn-level credit assignment)
-            combined_adv = _mt_grpo_normalize(outcome_rewards, index, epsilon)
-            advantages = combined_adv.unsqueeze(-1).expand(-1, seq_len) * response_mask.float()
+        turn_records_by_sample: list[list[dict[str, Any]]] = []
+        for i in range(batch_size):
+            turn_item = None
+            if turn_reward is not None and i < len(turn_reward):
+                turn_item = turn_reward[i]
+            info_i = None
+            if tool_interact_info is not None and i < len(tool_interact_info):
+                info_i = tool_interact_info[i]
+            turn_records_by_sample.append(_extract_turn_reward_records(turn_item, info_i))
+
+        has_turn_records = any(bool(records) for records in turn_records_by_sample)
+        if not has_turn_records:
             advantages = verl_F.masked_whiten(advantages, response_mask)
             return advantages, advantages
 
-        # 3. GRPO normalization for turn and outcome rewards
-        turn_adv = _mt_grpo_normalize(turn_rewards, index, epsilon)
-        outcome_adv = _mt_grpo_normalize(outcome_rewards, index, epsilon)
-        combined_rewards = turn_rewards + outcome_rewards
-        combined_adv = _mt_grpo_normalize(combined_rewards, index, epsilon)
+        turn_adv_by_sample = _normalize_sparse_turn_rewards(turn_records_by_sample, index, device, epsilon)
 
-        # 4. Find result segment for each sample
         result_segment_indices = []
         for i in range(batch_size):
             info_i = tool_interact_info[i] if tool_interact_info is not None and i < len(tool_interact_info) else None
-            result_seg = _find_result_segment(info_i)
-            result_segment_indices.append(result_seg)
+            result_segment_indices.append(_find_result_segment(info_i))
 
-        # 5. Assign advantages with turn-level credit assignment
-        advantages = torch.zeros(batch_size, seq_len, dtype=torch.float32, device=device)
+        arange = torch.arange(seq_len, device=device)
+        for i, records in enumerate(turn_records_by_sample):
+            if not records:
+                continue
+            mask_row = response_mask[i].float()
+            fallback_before_result_mask = None
 
-        for i in range(batch_size):
-            result_segment = result_segment_indices[i]
-            mask_row = response_mask[i]
+            for record in records:
+                turn = int(record.get("turn", 0))
+                turn_adv = turn_adv_by_sample[i].get(turn)
+                if turn_adv is None:
+                    continue
+                start = int(record.get("response_start", -1))
+                end = int(record.get("response_end", -1))
+                if 0 <= start < end:
+                    start = max(0, min(start, seq_len))
+                    end = max(start, min(end, seq_len))
+                    if end > start:
+                        advantages[i, start:end] += turn_coef * turn_adv * response_mask[i, start:end].float()
+                    continue
 
-            outcome_adv_i = outcome_adv[i]
-            turn_adv_i = turn_adv[i]
-            combined_adv_i = combined_adv[i]
+                if fallback_before_result_mask is None:
+                    fallback_before_result_mask = mask_row
+                    result_segment = result_segment_indices[i]
+                    if result_segment > 0:
+                        segment_boundaries = _get_segment_boundaries(response_mask[i])
+                        if result_segment < len(segment_boundaries):
+                            split_point = segment_boundaries[result_segment]
+                            fallback_before_result_mask = (arange < split_point).float() * mask_row
+                advantages[i] += turn_coef * turn_adv * fallback_before_result_mask
 
-            if result_segment > 0:
-                # Has <result> tag: apply turn-level credit assignment
-                segment_boundaries = _get_segment_boundaries(mask_row)
-
-                if result_segment < len(segment_boundaries):
-                    split_point = segment_boundaries[result_segment]
-                    # before_result_mask: 1 for tokens before <result>, 0 after
-                    before_result_mask = (torch.arange(seq_len, device=device) < split_point).float() * mask_row.float()
-
-                    # Core formula:
-                    # Before <result>: advantage = outcome_adv + turn_coef * turn_adv
-                    # After <result>: advantage = outcome_adv only
-                    advantages[i] = outcome_adv_i + turn_coef * turn_adv_i * before_result_mask
-                else:
-                    # Not enough segments, fallback to combined
-                    advantages[i] = combined_adv_i * mask_row.float()
-            else:
-                # No <result> tag: use combined advantage for all tokens
-                advantages[i] = combined_adv_i * mask_row.float()
-
-        # Apply mask and whiten
         advantages = advantages * response_mask.float()
         advantages = verl_F.masked_whiten(advantages, response_mask)
 

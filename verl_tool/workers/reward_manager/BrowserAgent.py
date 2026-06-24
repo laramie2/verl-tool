@@ -14,6 +14,7 @@ from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
 from verl.workers.reward_manager import register
+from verl_tool.utils.dense_reward import atomic_query_scores
 
 from mini_webarena.rl_utils import format_score
 from mini_webarena.evaluator import metric_heuristic
@@ -92,6 +93,7 @@ def browser_action_process_reward(tool_interact_info) -> dict[str, float]:
     if not tool_interact_info:
         return {
             "action_correctness_score": 0.0,
+            "process_penalty": 0.0,
             "hallucinated_id_penalty": 0.0,
             "tool_invalid_penalty": 0.0,
             "num_target_actions": 0,
@@ -117,7 +119,7 @@ def browser_action_process_reward(tool_interact_info) -> dict[str, float]:
         action = extract_browser_action(str(info.get("action", "")))
         if action:
             total_actions += 1
-        if info.get("valid_action") in (0, False):
+        if action and info.get("valid_action") in (0, False):
             tool_invalid += 1
 
         action_match = TARGET_ACTION_RE.match(action)
@@ -157,8 +159,11 @@ def browser_action_process_reward(tool_interact_info) -> dict[str, float]:
     action_correctness_score = (correct_actions - incorrect_actions) / denom
     hallucinated_id_penalty = -hallucinated_ids / denom
     tool_invalid_penalty = -tool_invalid / (total_actions if total_actions else 1)
+    bad_actions = incorrect_actions + max(0, tool_invalid - incorrect_actions)
+    process_penalty = -bad_actions / (total_actions if total_actions else 1)
     return {
         "action_correctness_score": float(action_correctness_score),
+        "process_penalty": float(process_penalty),
         "hallucinated_id_penalty": float(hallucinated_id_penalty),
         "tool_invalid_penalty": float(tool_invalid_penalty),
         "num_target_actions": int(target_actions),
@@ -167,6 +172,80 @@ def browser_action_process_reward(tool_interact_info) -> dict[str, float]:
         "num_element_mismatches": int(element_mismatches),
         "num_tool_invalid": int(tool_invalid),
     }
+
+
+def browser_dense_turn_rewards(
+    tool_interact_info,
+    retrieval_weight: float = 0.20,
+    refinement_weight: float = 0.10,
+    query_weight: float = 0.05,
+    action_penalty_weight: float = 0.05,
+    retrieval_decay: float = 0.05,
+) -> list[dict]:
+    """Build token-span aware turn rewards from compact browser interaction logs."""
+    if isinstance(tool_interact_info, np.ndarray):
+        tool_interact_info = tool_interact_info.tolist()
+
+    infos = [info for info in (tool_interact_info or []) if isinstance(info, dict)]
+    query_scores = atomic_query_scores(infos)
+    turns: dict[int, dict] = {}
+
+    def ensure_turn(turn) -> dict | None:
+        if not isinstance(turn, (int, np.integer)) or int(turn) < 0:
+            return None
+        turn = int(turn)
+        return turns.setdefault(
+            turn,
+            {
+                "turn": turn,
+                "response_start": -1,
+                "response_end": -1,
+                "retrieval": 0.0,
+                "refinement": 0.0,
+                "query": 0.0,
+                "action_penalty": 0.0,
+                "reward": 0.0,
+            },
+        )
+
+    for info in infos:
+        action_turn_entry = ensure_turn(info.get("action_turn_index"))
+        if action_turn_entry is not None:
+            retrieval_delta = float(info.get("retrieval_delta", 0.0) or 0.0)
+            if retrieval_delta > 0:
+                decay = float(np.exp(-retrieval_decay * action_turn_entry["turn"]))
+                action_turn_entry["retrieval"] += retrieval_delta * decay
+            action_turn_entry["query"] += float(query_scores.get(action_turn_entry["turn"], 0.0))
+
+            action = extract_browser_action(str(info.get("action", "")))
+            bad_action = bool(action) and (
+                info.get("valid_action") in (0, False)
+                or info.get("target_id_exists") is False
+                or info.get("element_type_match") is False
+            )
+            if bad_action:
+                action_turn_entry["action_penalty"] = -1.0
+
+        generation_turn_entry = ensure_turn(info.get("generation_turn_index"))
+        if generation_turn_entry is not None:
+            start = info.get("generation_response_start", -1)
+            end = info.get("generation_response_end", -1)
+            if isinstance(start, (int, np.integer)) and isinstance(end, (int, np.integer)):
+                generation_turn_entry["response_start"] = int(start)
+                generation_turn_entry["response_end"] = int(end)
+            generation_turn_entry["refinement"] += float(info.get("refinement_delta", 0.0) or 0.0)
+
+    result = []
+    for turn in sorted(turns):
+        entry = turns[turn]
+        entry["reward"] = float(
+            retrieval_weight * entry["retrieval"]
+            + refinement_weight * entry["refinement"]
+            + query_weight * entry["query"]
+            + action_penalty_weight * entry["action_penalty"]
+        )
+        result.append(entry)
+    return result
 
 def clean_text(text):
     # 删除控制字符 & 非打印字符
@@ -201,8 +280,8 @@ class WikiRLRewardManager:
             0.9,
         )
         self.structure_weight = _as_float(
-            _config_value(kwargs, "format_weight", "BROWSER_AGENT_FORMAT_WEIGHT", 0.1),
-            0.1,
+            _config_value(kwargs, "format_weight", "BROWSER_AGENT_FORMAT_WEIGHT", 0.05),
+            0.05,
         )
         self.enable_process_reward = _as_bool(
             _config_value(kwargs, "enable_process_reward", "BROWSER_AGENT_ENABLE_PROCESS_REWARD", True),
@@ -213,18 +292,18 @@ class WikiRLRewardManager:
                 kwargs,
                 "action_correctness_weight",
                 "BROWSER_AGENT_ACTION_CORRECTNESS_WEIGHT",
-                0.1,
+                0.0,
             ),
-            0.1,
+            0.0,
         )
         self.hallucinated_id_penalty_weight = _as_float(
             _config_value(
                 kwargs,
                 "hallucinated_id_penalty_weight",
                 "BROWSER_AGENT_HALLUCINATED_ID_PENALTY_WEIGHT",
-                0.1,
+                0.0,
             ),
-            0.1,
+            0.0,
         )
         self.tool_invalid_penalty_weight = _as_float(
             _config_value(
@@ -234,6 +313,60 @@ class WikiRLRewardManager:
                 0.0,
             ),
             0.0,
+        )
+        self.process_penalty_weight = _as_float(
+            _config_value(
+                kwargs,
+                "process_penalty_weight",
+                "BROWSER_AGENT_PROCESS_PENALTY_WEIGHT",
+                0.05,
+            ),
+            0.05,
+        )
+        self.retrieval_reward_weight = _as_float(
+            _config_value(
+                kwargs,
+                "retrieval_reward_weight",
+                "BROWSER_AGENT_RETRIEVAL_REWARD_WEIGHT",
+                0.20,
+            ),
+            0.20,
+        )
+        self.refinement_reward_weight = _as_float(
+            _config_value(
+                kwargs,
+                "refinement_reward_weight",
+                "BROWSER_AGENT_REFINEMENT_REWARD_WEIGHT",
+                0.10,
+            ),
+            0.10,
+        )
+        self.query_reward_weight = _as_float(
+            _config_value(
+                kwargs,
+                "query_reward_weight",
+                "BROWSER_AGENT_QUERY_REWARD_WEIGHT",
+                0.05,
+            ),
+            0.05,
+        )
+        self.action_penalty_turn_weight = _as_float(
+            _config_value(
+                kwargs,
+                "action_penalty_turn_weight",
+                "BROWSER_AGENT_ACTION_PENALTY_TURN_WEIGHT",
+                0.05,
+            ),
+            0.05,
+        )
+        self.retrieval_decay = _as_float(
+            _config_value(
+                kwargs,
+                "retrieval_decay",
+                "BROWSER_AGENT_RETRIEVAL_DECAY",
+                0.05,
+            ),
+            0.05,
         )
         if "record_dir" in kwargs:
             self.record_dir = Path(kwargs['record_dir'])
@@ -416,6 +549,14 @@ class WikiRLRewardManager:
         action_correctness_scores = []
         hallucinated_id_penalties = []
         tool_invalid_penalties = []
+        process_penalties = []
+        turn_rewards = []
+        dense_reward_sums = []
+        dense_retrieval_rewards = []
+        dense_refinement_rewards = []
+        dense_query_rewards = []
+        dense_action_penalties = []
+        dense_num_turns = []
         num_target_actions = []
         num_correct_actions = []
         num_hallucinated_ids = []
@@ -439,9 +580,28 @@ class WikiRLRewardManager:
             action_correctness_reward = process_scores["action_correctness_score"] if self.enable_process_reward else 0.0
             hallucinated_id_penalty = process_scores["hallucinated_id_penalty"] if self.enable_process_reward else 0.0
             tool_invalid_penalty = process_scores["tool_invalid_penalty"] if self.enable_process_reward else 0.0
+            process_penalty = process_scores["process_penalty"] if self.enable_process_reward else 0.0
+            dense_turn_reward = (
+                browser_dense_turn_rewards(
+                    tool_interact_info,
+                    retrieval_weight=self.retrieval_reward_weight,
+                    refinement_weight=self.refinement_reward_weight,
+                    query_weight=self.query_reward_weight,
+                    action_penalty_weight=self.action_penalty_turn_weight,
+                    retrieval_decay=self.retrieval_decay,
+                )
+                if self.enable_process_reward
+                else []
+            )
+            dense_reward_sum = float(sum(item.get("reward", 0.0) for item in dense_turn_reward))
+            dense_retrieval_sum = float(sum(item.get("retrieval", 0.0) for item in dense_turn_reward))
+            dense_refinement_sum = float(sum(item.get("refinement", 0.0) for item in dense_turn_reward))
+            dense_query_sum = float(sum(item.get("query", 0.0) for item in dense_turn_reward))
+            dense_action_penalty_sum = float(sum(item.get("action_penalty", 0.0) for item in dense_turn_reward))
             final_reward = (
                 self.fuzzy_weight * answer_reward +
                 self.structure_weight * format_reward +
+                self.process_penalty_weight * process_penalty +
                 self.action_correctness_weight * action_correctness_reward +
                 self.hallucinated_id_penalty_weight * hallucinated_id_penalty +
                 self.tool_invalid_penalty_weight * tool_invalid_penalty
@@ -457,6 +617,14 @@ class WikiRLRewardManager:
             action_correctness_scores.append(action_correctness_reward)
             hallucinated_id_penalties.append(hallucinated_id_penalty)
             tool_invalid_penalties.append(tool_invalid_penalty)
+            process_penalties.append(process_penalty)
+            turn_rewards.append({"turns": dense_turn_reward})
+            dense_reward_sums.append(dense_reward_sum)
+            dense_retrieval_rewards.append(dense_retrieval_sum)
+            dense_refinement_rewards.append(dense_refinement_sum)
+            dense_query_rewards.append(dense_query_sum)
+            dense_action_penalties.append(dense_action_penalty_sum)
+            dense_num_turns.append(len(dense_turn_reward))
             num_target_actions.append(process_scores["num_target_actions"])
             num_correct_actions.append(process_scores["num_correct_actions"])
             num_hallucinated_ids.append(process_scores["num_hallucinated_ids"])
@@ -520,6 +688,14 @@ class WikiRLRewardManager:
                     "browser_action_correctness_score": action_correctness_scores,
                     "browser_hallucinated_id_penalty": hallucinated_id_penalties,
                     "browser_tool_invalid_penalty": tool_invalid_penalties,
+                    "browser_process_penalty": process_penalties,
+                    "browser_dense_reward_sum": dense_reward_sums,
+                    "browser_dense_retrieval_reward": dense_retrieval_rewards,
+                    "browser_dense_refinement_reward": dense_refinement_rewards,
+                    "browser_dense_query_reward": dense_query_rewards,
+                    "browser_dense_action_penalty": dense_action_penalties,
+                    "browser_turn_reward_num_turns": dense_num_turns,
+                    "turn_reward": turn_rewards,
                     "browser_num_target_actions": num_target_actions,
                     "browser_num_correct_actions": num_correct_actions,
                     "browser_num_hallucinated_ids": num_hallucinated_ids,

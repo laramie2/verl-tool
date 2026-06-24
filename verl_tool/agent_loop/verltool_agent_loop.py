@@ -29,6 +29,11 @@ from verl.utils.profiler import simple_timer
 from .agent_loop import AgentLoopBase, register, AgentLoopOutput
 from .vision_utils import decode_image_url, encode_image, encode_image_url
 from verl_tool.utils.dataset.audio_utils import encode_audio_data
+from verl_tool.utils.dense_reward import (
+    ground_truth_match_score,
+    normalize_ground_truths,
+    refinement_candidate_text,
+)
 import socket
 
 import textwrap
@@ -256,6 +261,15 @@ def compact_tool_interact_info_entries(tool_interact_info: list[dict[str, Any]])
                 )
                 if obs_is_str
                 else False,
+                "action_turn_index": info.get("action_turn_index", -1),
+                "generation_turn_index": info.get("generation_turn_index", -1),
+                "generation_response_start": info.get("generation_response_start", -1),
+                "generation_response_end": info.get("generation_response_end", -1),
+                "gt_match_score": float(info.get("gt_match_score", 0.0) or 0.0),
+                "retrieval_delta": float(info.get("retrieval_delta", 0.0) or 0.0),
+                "first_gt_hit": bool(info.get("first_gt_hit", False)),
+                "refinement_match_score": float(info.get("refinement_match_score", 0.0) or 0.0),
+                "refinement_delta": float(info.get("refinement_delta", 0.0) or 0.0),
                 **action_reward_fields,
             }
         )
@@ -1318,6 +1332,16 @@ class VerlToolAgentLoop(AgentLoopBase):
             "opd_reason_mask": []
         }
 
+        reward_model = kwargs.get("reward_model", {})
+        if isinstance(reward_model, np.ndarray) and reward_model.size == 1:
+            reward_model = reward_model.item()
+        ground_truths = normalize_ground_truths(
+            reward_model.get("ground_truth") if isinstance(reward_model, dict) else None
+        )
+        best_visible_evidence = 0.0
+        best_attributed_evidence = 0.0
+        best_refinement = 0.0
+
         # ================= [新增模块: 初始化 Token 统计字典] =================
         token_stats = {
             "initial_prompt_tokens": len(prompt_ids),
@@ -1412,6 +1436,8 @@ class VerlToolAgentLoop(AgentLoopBase):
                 # Keep the text observation that the model saw before compression so
                 # action-ID rewards can be computed against real browser element IDs.
                 tool_results["browser_obs_for_reward"] = obs_text
+                tool_results["action_turn_index"] = step - 1
+                reward_visible_obs = obs_text
 
                 # ================= [新增模块: 截获压缩前的原始文本 Token] =================
                 # 记录未经任何压缩的原始环境反馈长度，用于后续评估压缩率
@@ -1460,10 +1486,20 @@ class VerlToolAgentLoop(AgentLoopBase):
                         "title": "--- SYSTEM OBSERVATION ---",
                         "use_compact_mode": True
                     }
-                    raw_img, _ = await loop.run_in_executor(
+                    raw_img, rendered_char_count = await loop.run_in_executor(
                         None, 
                         lambda: self.vtc.render_text_to_image(**render_kwargs)
                     )
+                    compact_obs = self.vtc._compact_text(obs_text[:25000])
+                    wrapped_obs = self.vtc._wrap_text_fast(compact_obs, 1024 - 40)
+                    visible_lines = []
+                    visible_chars = 0
+                    for line in wrapped_obs:
+                        if visible_chars + len(line) > rendered_char_count:
+                            break
+                        visible_lines.append(line)
+                        visible_chars += len(line)
+                    reward_visible_obs = " ".join(visible_lines)
                     
                     COMPRESSION_FACTOR = 1.5 
                     compressed_img_list = await loop.run_in_executor(
@@ -1577,6 +1613,22 @@ class VerlToolAgentLoop(AgentLoopBase):
                             obs_token_ids = obs_token_ids[:half_len] + self.tokenizer.encode("...(truncated)...") + obs_token_ids[-half_len:]
                         else:
                             raise ValueError(f"Invalid truncate_obs_side: {self.agent_config.truncate_obs_side}")
+                    reward_visible_obs = self.tokenizer.decode(obs_token_ids, skip_special_tokens=True)
+
+                visible_match = ground_truth_match_score(reward_visible_obs, ground_truths)
+                previous_attributed_evidence = best_attributed_evidence
+                best_visible_evidence = max(best_visible_evidence, visible_match)
+                if step > 0 and action_text.strip():
+                    best_attributed_evidence = max(best_attributed_evidence, visible_match)
+                tool_results["gt_match_score"] = visible_match
+                tool_results["retrieval_delta"] = max(
+                    0.0, best_attributed_evidence - previous_attributed_evidence
+                )
+                tool_results["first_gt_hit"] = bool(
+                    step > 0
+                    and previous_attributed_evidence == 0.0
+                    and best_attributed_evidence > 0.0
+                )
                 
                 if self.enable_mtrl:
                     obs_token_ids = self.mtrl_sep_prefix_ids + obs_token_ids + self.mtrl_sep_suffix_ids
@@ -1678,6 +1730,19 @@ class VerlToolAgentLoop(AgentLoopBase):
             running_prompt_ids.extend(gen_ids)
             response_mask.extend([1] * len(gen_ids))
             response_logprobs.extend(gen_logprobs)
+            if use_tool and stats_dict["tool_interact_info"]:
+                current_info = stats_dict["tool_interact_info"][-1]
+                current_info["generation_turn_index"] = step
+                current_info["generation_response_start"] = response_offset_before_gen
+                current_info["generation_response_end"] = response_offset_before_gen + len(gen_ids)
+                refinement_score = (
+                    ground_truth_match_score(refinement_candidate_text(gen_text), ground_truths)
+                    if best_visible_evidence > 0.0
+                    else 0.0
+                )
+                current_info["refinement_match_score"] = refinement_score
+                current_info["refinement_delta"] = max(0.0, refinement_score - best_refinement)
+                best_refinement = max(best_refinement, refinement_score)
             if self.agent_config.opd_enable and not kwargs.get("validate", False):
                 stats_dict["opd_reason_mask"].extend(gen_reason_mask)
                 stats_dict["opd_steps"].append(

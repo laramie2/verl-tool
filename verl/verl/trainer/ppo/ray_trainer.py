@@ -62,6 +62,35 @@ from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 
 
+_REWARD_EXTRA_METRIC_PREFIXES = ("wiki_", "browser_")
+_REWARD_EXTRA_SKIP_KEYS = {"turn_reward"}
+
+
+def _update_reward_extra_metrics(metrics: dict, reward_extra_infos_dict: dict | None) -> None:
+    """Expose scalar reward-manager diagnostics in train step console/wandb logs."""
+    if not reward_extra_infos_dict:
+        return
+    for key, values in reward_extra_infos_dict.items():
+        if key in _REWARD_EXTRA_SKIP_KEYS or not key.startswith(_REWARD_EXTRA_METRIC_PREFIXES):
+            continue
+        numeric_values = []
+        for value in values:
+            if isinstance(value, np.ndarray):
+                if value.size != 1:
+                    continue
+                value = value.item()
+            elif isinstance(value, np.generic):
+                value = value.item()
+            if isinstance(value, (bool, int, float)):
+                numeric_values.append(float(value))
+        if not numeric_values:
+            continue
+        arr = np.asarray(numeric_values, dtype=np.float64)
+        metrics[f"reward_extra/{key}/mean"] = float(arr.mean())
+        metrics[f"reward_extra/{key}/max"] = float(arr.max())
+        metrics[f"reward_extra/{key}/min"] = float(arr.min())
+
+
 @dataclass
 class ResourcePoolManager:
     """
@@ -646,6 +675,10 @@ class RayPPOTrainer:
                 dump_path=val_data_dir,
             )
 
+        # Structured turn rewards are consumed by MT-GRPO during training;
+        # validation metrics expect scalar lists.
+        reward_extra_infos_dict.pop("turn_reward", None)
+
         for key_info, lst in reward_extra_infos_dict.items():
             assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
 
@@ -1225,6 +1258,7 @@ class RayPPOTrainer:
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+                            _update_reward_extra_metrics(metrics, reward_extra_infos_dict)
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
