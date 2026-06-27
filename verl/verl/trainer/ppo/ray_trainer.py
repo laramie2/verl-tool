@@ -19,6 +19,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import json
+import math
 import os
 import uuid
 from collections import defaultdict
@@ -708,7 +709,54 @@ class RayPPOTrainer:
             metric_dict["val-aux/num_turns/max"] = sample_turns.max()
             metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
 
+        reward_mean_keys = [
+            key
+            for key, value in metric_dict.items()
+            if key.startswith("val-core/")
+            and key.endswith("/reward/mean@1")
+            and isinstance(value, (int, float, np.number))
+        ]
+        if reward_mean_keys:
+            metric_dict["val-core/all/reward/mean@1"] = float(
+                np.mean([float(metric_dict[key]) for key in reward_mean_keys])
+            )
+
         return metric_dict
+
+    def _get_best_checkpoint_metric(self, val_metrics: dict):
+        metric_key = self.config.trainer.get("save_best_metric", None)
+        if metric_key:
+            if metric_key not in val_metrics:
+                available = ", ".join(sorted(val_metrics.keys()))
+                raise KeyError(
+                    f"trainer.save_best_metric={metric_key!r} is not in validation metrics. "
+                    f"Available metrics: {available}"
+                )
+            return metric_key, float(val_metrics[metric_key])
+
+        candidates = [
+            key
+            for key, value in val_metrics.items()
+            if key.startswith("val-core/") and isinstance(value, (int, float, np.number))
+        ]
+        if not candidates:
+            return None, None
+        selected_key = sorted(candidates)[0]
+        return selected_key, float(val_metrics[selected_key])
+
+    def _is_better_checkpoint_metric(self, metric_value: float, best_metric_value: Optional[float]):
+        if not math.isfinite(metric_value):
+            return False
+        if best_metric_value is None:
+            return True
+
+        mode = self.config.trainer.get("save_best_mode", "max")
+        min_delta = float(self.config.trainer.get("save_best_min_delta", 0.0))
+        if mode == "max":
+            return metric_value > best_metric_value + min_delta
+        if mode == "min":
+            return metric_value < best_metric_value - min_delta
+        raise ValueError(f"trainer.save_best_mode must be 'max' or 'min', got {mode!r}")
 
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
@@ -1074,6 +1122,10 @@ class RayPPOTrainer:
         )
 
         self.global_steps = 0
+        save_best_by_metric = self.config.trainer.get("save_best_by_metric", False)
+        best_checkpoint_metric_key = None
+        best_checkpoint_metric_value = None
+        best_checkpoint_step = None
 
         # load checkpoint before doing anything
         self._load_checkpoint()
@@ -1084,6 +1136,14 @@ class RayPPOTrainer:
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
+            if save_best_by_metric:
+                best_checkpoint_metric_key, best_checkpoint_metric_value = self._get_best_checkpoint_metric(val_metrics)
+                best_checkpoint_step = self.global_steps if best_checkpoint_metric_key is not None else None
+                if best_checkpoint_metric_key is not None:
+                    print(
+                        "Initial best checkpoint metric baseline: "
+                        f"{best_checkpoint_metric_key}={best_checkpoint_metric_value} at step {best_checkpoint_step}"
+                    )
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
                 return
@@ -1312,6 +1372,8 @@ class RayPPOTrainer:
                     if rollout_data_dir:
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 
+                save_due_to_best_metric = False
+
                 # validate
                 if (
                     self.val_reward_fn is not None
@@ -1324,23 +1386,61 @@ class RayPPOTrainer:
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)
 
+                    if save_best_by_metric and val_metrics:
+                        metric_key, metric_value = self._get_best_checkpoint_metric(val_metrics)
+                        if metric_key is not None:
+                            improved = self._is_better_checkpoint_metric(metric_value, best_checkpoint_metric_value)
+                            metrics["checkpoint/best_metric_current"] = metric_value
+                            metrics["checkpoint/best_metric_value"] = (
+                                metric_value
+                                if improved
+                                else (
+                                    best_checkpoint_metric_value
+                                    if best_checkpoint_metric_value is not None
+                                    else float("nan")
+                                )
+                            )
+                            metrics["checkpoint/best_metric_improved"] = float(improved)
+                            if improved:
+                                best_checkpoint_metric_key = metric_key
+                                best_checkpoint_metric_value = metric_value
+                                best_checkpoint_step = self.global_steps
+                                save_due_to_best_metric = True
+                                print(
+                                    "New best checkpoint metric: "
+                                    f"{metric_key}={metric_value} at step {self.global_steps}"
+                                )
+                            else:
+                                print(
+                                    "Checkpoint metric did not improve: "
+                                    f"{metric_key}={metric_value}, best={best_checkpoint_metric_value} "
+                                    f"at step {best_checkpoint_step}"
+                                )
+
                 # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                 esi_close_to_expiration = should_save_ckpt_esi(
                     max_steps_duration=self.max_steps_duration,
                     redundant_time=self.config.trainer.esi_redundant_time,
                 )
-                # Check if the conditions for saving a checkpoint are met.
-                # The conditions include a mandatory condition (1) and
-                # one of the following optional conditions (2/3/4):
-                # 1. The save frequency is set to a positive value.
-                # 2. It's the last training step.
-                # 3. The current step number is a multiple of the save frequency.
-                # 4. The ESI(Elastic Server Instance)/training plan is close to expiration.
-                if self.config.trainer.save_freq > 0 and (
-                    is_last_step or self.global_steps % self.config.trainer.save_freq == 0 or esi_close_to_expiration
-                ):
-                    if esi_close_to_expiration:
-                        print("Force saving checkpoint: ESI instance expiration approaching.")
+                save_due_to_freq = self.config.trainer.save_freq > 0 and (
+                    is_last_step or self.global_steps % self.config.trainer.save_freq == 0
+                )
+                save_due_to_last = is_last_step and self.config.trainer.get("save_last", False)
+                save_due_to_esi = esi_close_to_expiration
+                should_save_checkpoint = (
+                    save_due_to_best_metric or save_due_to_freq or save_due_to_last or save_due_to_esi
+                )
+                if should_save_checkpoint:
+                    save_reasons = []
+                    if save_due_to_best_metric:
+                        save_reasons.append("best_metric")
+                    if save_due_to_freq:
+                        save_reasons.append("save_freq")
+                    if save_due_to_last:
+                        save_reasons.append("last_step")
+                    if save_due_to_esi:
+                        save_reasons.append("esi_expiration")
+                    print(f"Saving checkpoint at step {self.global_steps}; reasons={','.join(save_reasons)}")
                     with marked_timer("save_checkpoint", timing_raw, color="green"):
                         self._save_checkpoint()
 
