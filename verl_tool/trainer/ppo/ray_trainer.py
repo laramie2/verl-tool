@@ -1,3 +1,4 @@
+import gc
 import ray
 import uuid
 import torch
@@ -38,6 +39,15 @@ from verl.utils.tracking import Tracking
 
 _REWARD_EXTRA_METRIC_PREFIXES = ("wiki_", "browser_")
 _REWARD_EXTRA_SKIP_KEYS = {"turn_reward"}
+STEP_GC_EACH_STEP = os.getenv("VERLTOOL_GC_EACH_STEP", "1").strip().lower() in {"1", "true", "yes", "on"}
+STEP_EMPTY_CUDA_CACHE = os.getenv("VERLTOOL_EMPTY_CUDA_CACHE_EACH_STEP", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _cleanup_step_memory() -> None:
+    if STEP_GC_EACH_STEP:
+        gc.collect()
+    if STEP_EMPTY_CUDA_CACHE and torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def _update_reward_extra_metrics(metrics: dict, reward_extra_infos_dict: dict | None) -> None:
@@ -501,6 +511,19 @@ class AgentRayPPOTrainer(RayPPOTrainer):
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 metrics = {}
+                gen_batch = None
+                gen_batch_output = None
+                gen_baseline_batch = None
+                gen_baseline_output = None
+                new_batch = None
+                model_forward_batch = None
+                reward_tensor = None
+                reward_extra_infos_dict = None
+                reward_baseline_tensor = None
+                rm_scores = None
+                values = None
+                critic_output = None
+                actor_output = None
 
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
@@ -612,6 +635,13 @@ class AgentRayPPOTrainer(RayPPOTrainer):
                     )
                     if not ready_to_update:
                         self.gen_steps += 1
+                        new_batch = None
+                        gen_batch = None
+                        gen_batch_output = None
+                        reward_tensor = None
+                        reward_extra_infos_dict = None
+                        rm_scores = None
+                        _cleanup_step_memory()
                         continue
 
                     if self.config.trainer.balance_batch:
@@ -794,10 +824,29 @@ class AgentRayPPOTrainer(RayPPOTrainer):
                 if hasattr(self.train_dataset, "on_batch_end"):
                     self.train_dataset.on_batch_end(batch=batch)
 
+                # Break references to large per-step DataProto/TensorDict objects before
+                # the next rollout starts. This helps Ray avoid crossing its node memory
+                # kill threshold when rollout outputs, reward inputs, and update batches
+                # briefly coexist on the driver.
+                new_batch = None
+                gen_batch = None
+                gen_batch_output = None
+                gen_baseline_batch = None
+                gen_baseline_output = None
+                model_forward_batch = None
+                reward_tensor = None
+                reward_extra_infos_dict = None
+                reward_baseline_tensor = None
+                rm_scores = None
+                values = None
+                critic_output = None
+                actor_output = None
+
                 timing_raw = defaultdict(float)
                 batch = None
                 num_prompt_in_batch = 0
                 num_gen_batches = 0
+                _cleanup_step_memory()
     
     def _validate(self):
         data_source_lst = []

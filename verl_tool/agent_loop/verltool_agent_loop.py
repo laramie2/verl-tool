@@ -59,6 +59,41 @@ CONTROL_CHAR_RE = re.compile(
 )
 MAX_OBS_LENGTH = 100000  # maximum observation length to send back to the tool server
 
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float) -> float:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    try:
+        return float(raw_value)
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    try:
+        return int(raw_value)
+    except ValueError:
+        return default
+
+
+ROLLOUT_LOG_DETAIL = _env_flag("VERLTOOL_ROLLOUT_LOG_DETAIL", False)
+ROLLOUT_LOG_INCLUDE_FULL_TEXT = _env_flag("VERLTOOL_ROLLOUT_LOG_INCLUDE_FULL_TEXT", False)
+ROLLOUT_LOG_SAMPLE_RATE = max(0.0, min(1.0, _env_float("VERLTOOL_ROLLOUT_LOG_SAMPLE_RATE", 0.0)))
+ROLLOUT_LOG_MAX_TEXT_CHARS = max(0, _env_int("VERLTOOL_ROLLOUT_LOG_MAX_TEXT_CHARS", 512))
+ROLLOUT_LOG_SLOW_MS = _env_float("VERLTOOL_ROLLOUT_LOG_SLOW_MS", 30000.0)
+COMPACT_TOOL_INFO_INLINE = _env_flag("VERLTOOL_COMPACT_TOOL_INFO_INLINE", True)
+
 async def on_connection_queued_start(session, trace_config_ctx, params):
     if hasattr(trace_config_ctx, 'trace_request_ctx') and trace_config_ctx.trace_request_ctx is not None:
         trace_config_ctx.trace_request_ctx['queued_start'] = asyncio.get_event_loop().time()
@@ -160,6 +195,21 @@ def sanitize_request(obj: Any) -> Any:
 OBS_ELEMENT_RE = re.compile(r"^[\t ]*(?:\[|<)(\d+)(?:\]|>)\s+([a-zA-Z]+)", re.MULTILINE)
 ACTION_BLOCK_RE = re.compile(r"```(.*?)```|<action>(.*?)</action>", re.DOTALL)
 TARGET_ACTION_RE = re.compile(r"^(click|type|hover|tab_focus)\s+(?:\[|<)(\d+)(?:\]|>)")
+TOOL_TIMING_INFO_KEYS = (
+    "processing_time_ms",
+    "queue_time_ms",
+    "tool_queue_time_ms",
+    "client_queued_ms",
+    "client_conn_create_ms",
+    "client_request_send_ms",
+    "request_start_ms",
+    "response_read_ms",
+    "response_size_mb",
+    "time awaiting response_ms",
+    "interact_time_ms",
+    "session_request_time",
+    "X-Process-Time",
+)
 
 
 def _browser_obs_elements(observation: str) -> dict[str, str]:
@@ -196,85 +246,146 @@ def _browser_is_element_mismatch(verb: str, target_type: str) -> bool:
     return False
 
 
-def compact_tool_interact_info_entries(tool_interact_info: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _extract_action_type(action: str) -> str:
+    action = _browser_extract_action(str(action or "")).strip()
+    if not action:
+        return ""
+    return action.split()[0].lower()
+
+
+def _text_preview(text: str, max_chars: int = ROLLOUT_LOG_MAX_TEXT_CHARS) -> str:
+    if not isinstance(text, str):
+        text = str(text)
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    return text[:max_chars] + f"...(truncated {len(text) - max_chars} chars)"
+
+
+def _stable_sample_enabled(key: str, rate: float) -> bool:
+    if rate <= 0:
+        return False
+    if rate >= 1:
+        return True
+    try:
+        value = int(str(key)[-8:], 16) % 1_000_000
+    except ValueError:
+        value = sum(ord(ch) for ch in str(key)) % 1_000_000
+    return value / 1_000_000.0 < rate
+
+
+def _rollout_log_full_text() -> bool:
+    return ROLLOUT_LOG_DETAIL and ROLLOUT_LOG_INCLUDE_FULL_TEXT
+
+
+def _should_log_rollout_detail(request_id: str, event: str, payload: dict[str, Any] | None = None) -> bool:
+    if ROLLOUT_LOG_DETAIL:
+        return True
+    if _stable_sample_enabled(f"{request_id}:{event}", ROLLOUT_LOG_SAMPLE_RATE):
+        return True
+    if event == "environment_observation" and payload:
+        status = payload.get("tool_status", {}) or {}
+        latency = max(
+            float(status.get("processing_time_ms") or 0.0),
+            float(status.get("interact_time_ms") or 0.0),
+        )
+        return latency >= ROLLOUT_LOG_SLOW_MS
+    return False
+
+
+def compact_tool_interact_info_entry(info: dict[str, Any], previous_obs: str = "") -> tuple[dict[str, Any] | None, str]:
     """Drop large observations while keeping reward-relevant browser action signals."""
+    if info is None:
+        return None, previous_obs
+
+    obs = info.get("obs", "")
+    obs_for_reward = info.get("browser_obs_for_reward", obs)
+    obs_is_str = isinstance(obs, str)
+    obs_nonempty = bool(obs.strip()) if obs_is_str else False
+    obs_lower = obs.lower() if obs_is_str else ""
+
+    action = _browser_extract_action(str(info.get("action", "")))
+    action_match = TARGET_ACTION_RE.match(action)
+    action_reward_fields = {
+        "action": action,
+        "action_verb": action.split()[0] if action else "",
+        "action_target_id": None,
+        "action_target_type": None,
+        "target_id_exists": None,
+        "element_type_match": None,
+    }
+    if action_match:
+        verb = action_match.group(1)
+        target_id = action_match.group(2)
+        elements = _browser_obs_elements(previous_obs)
+        target_type = elements.get(target_id)
+        action_reward_fields.update(
+            {
+                "action_verb": verb,
+                "action_target_id": target_id,
+                "action_target_type": target_type,
+                "target_id_exists": target_id in elements,
+                "element_type_match": (
+                    None
+                    if target_type is None
+                    else not _browser_is_element_mismatch(verb, target_type)
+                ),
+            }
+        )
+
+    compacted = {
+        "valid_action": bool(info.get("valid_action", False)),
+        "success": info.get("success", None),
+        "done": bool(info.get("done", False)),
+        "finish": bool(info.get("finish", False)),
+        "reward": info.get("reward", None),
+        "invalid_reason": info.get("invalid_reason", None),
+        "obs_nonempty": obs_nonempty,
+        "obs_is_error": (("Error:" in obs) or ("Traceback" in obs) or ("exception" in obs_lower)) if obs_is_str else False,
+        "obs_has_result_or_output": (("<result>" in obs) or ("<output>" in obs)) if obs_is_str else False,
+        "action_turn_index": info.get("action_turn_index", -1),
+        "generation_turn_index": info.get("generation_turn_index", -1),
+        "generation_response_start": info.get("generation_response_start", -1),
+        "generation_response_end": info.get("generation_response_end", -1),
+        "gt_match_score": float(info.get("gt_match_score", 0.0) or 0.0),
+        "retrieval_delta": float(info.get("retrieval_delta", 0.0) or 0.0),
+        "first_gt_hit": bool(info.get("first_gt_hit", False)),
+        "refinement_match_score": float(info.get("refinement_match_score", 0.0) or 0.0),
+        "refinement_delta": float(info.get("refinement_delta", 0.0) or 0.0),
+        **action_reward_fields,
+    }
+
+    for key in TOOL_TIMING_INFO_KEYS:
+        value = info.get(key, None)
+        if value is None:
+            continue
+        try:
+            compacted[key] = float(value)
+        except (TypeError, ValueError):
+            compacted[key] = value
+
+    if "queue_time_ms" not in compacted and "tool_queue_time_ms" in compacted:
+        compacted["queue_time_ms"] = compacted["tool_queue_time_ms"]
+    if "tool_queue_time_ms" not in compacted and "queue_time_ms" in compacted:
+        compacted["tool_queue_time_ms"] = compacted["queue_time_ms"]
+
+    metrics = info.get("metrics")
+    if isinstance(metrics, dict):
+        compacted["metrics"] = {}
+        for key, value in metrics.items():
+            if isinstance(value, (int, float, np.integer, np.floating)):
+                compacted["metrics"][key] = float(value)
+
+    if isinstance(obs_for_reward, str):
+        previous_obs = obs_for_reward
+    return compacted, previous_obs
+
+
+def compact_tool_interact_info_entries(tool_interact_info: list[dict[str, Any]]) -> list[dict[str, Any]]:
     compacted = []
     previous_obs = ""
     for info in tool_interact_info:
-        if info is None:
-            compacted.append(None)
-            continue
-
-        obs = info.get("obs", "")
-        obs_for_reward = info.get("browser_obs_for_reward", obs)
-        obs_is_str = isinstance(obs, str)
-        obs_nonempty = bool(obs.strip()) if obs_is_str else False
-        obs_lower = obs.lower() if obs_is_str else ""
-
-        action = _browser_extract_action(str(info.get("action", "")))
-        action_match = TARGET_ACTION_RE.match(action)
-        action_reward_fields = {
-            "action": action,
-            "action_verb": action.split()[0] if action else "",
-            "action_target_id": None,
-            "action_target_type": None,
-            "target_id_exists": None,
-            "element_type_match": None,
-        }
-        if action_match:
-            verb = action_match.group(1)
-            target_id = action_match.group(2)
-            elements = _browser_obs_elements(previous_obs)
-            target_type = elements.get(target_id)
-            action_reward_fields.update(
-                {
-                    "action_verb": verb,
-                    "action_target_id": target_id,
-                    "action_target_type": target_type,
-                    "target_id_exists": target_id in elements,
-                    "element_type_match": (
-                        None
-                        if target_type is None
-                        else not _browser_is_element_mismatch(verb, target_type)
-                    ),
-                }
-            )
-
-        compacted.append(
-            {
-                "valid_action": bool(info.get("valid_action", False)),
-                "success": info.get("success", None),
-                "done": bool(info.get("done", False)),
-                "finish": bool(info.get("finish", False)),
-                "reward": info.get("reward", None),
-                "invalid_reason": info.get("invalid_reason", None),
-                "obs_nonempty": obs_nonempty,
-                "obs_is_error": (
-                    ("Error:" in obs)
-                    or ("Traceback" in obs)
-                    or ("exception" in obs_lower)
-                )
-                if obs_is_str
-                else False,
-                "obs_has_result_or_output": (
-                    ("<result>" in obs) or ("<output>" in obs)
-                )
-                if obs_is_str
-                else False,
-                "action_turn_index": info.get("action_turn_index", -1),
-                "generation_turn_index": info.get("generation_turn_index", -1),
-                "generation_response_start": info.get("generation_response_start", -1),
-                "generation_response_end": info.get("generation_response_end", -1),
-                "gt_match_score": float(info.get("gt_match_score", 0.0) or 0.0),
-                "retrieval_delta": float(info.get("retrieval_delta", 0.0) or 0.0),
-                "first_gt_hit": bool(info.get("first_gt_hit", False)),
-                "refinement_match_score": float(info.get("refinement_match_score", 0.0) or 0.0),
-                "refinement_delta": float(info.get("refinement_delta", 0.0) or 0.0),
-                **action_reward_fields,
-            }
-        )
-        if isinstance(obs_for_reward, str):
-            previous_obs = obs_for_reward
+        item, previous_obs = compact_tool_interact_info_entry(info, previous_obs)
+        compacted.append(item)
     return compacted
     
 @register("verltool_agent")
@@ -734,6 +845,10 @@ class VerlToolAgentLoop(AgentLoopBase):
         for key in response.keys():
             if key not in ['observations', 'dones', 'valids', 'processing_time_ms', 'success'] and isinstance(response[key], float):
                 tool_interact_info[key] = response[key]
+        if 'queue_time_ms' in tool_interact_info and 'tool_queue_time_ms' not in tool_interact_info:
+            tool_interact_info['tool_queue_time_ms'] = tool_interact_info['queue_time_ms']
+        if 'tool_queue_time_ms' in tool_interact_info and 'queue_time_ms' not in tool_interact_info:
+            tool_interact_info['queue_time_ms'] = tool_interact_info['tool_queue_time_ms']
         return tool_interact_info
         
 
@@ -1325,6 +1440,8 @@ class VerlToolAgentLoop(AgentLoopBase):
             "obs_lengths": [],
             "rewards": [],
             "tool_interact_info": [],
+            "tool_interact_info_compacted": False,
+            "tool_interact_prev_obs": "",
             "is_traj_finished": False,
             "valid_traj": 1,
             "retokenization_diff": [],
@@ -1445,29 +1562,42 @@ class VerlToolAgentLoop(AgentLoopBase):
                 token_stats["total_original_obs_text_tokens"] += raw_text_len
                 # =====================================================================
 
-                # ================= [新增日志：写入文件记录工具反馈] =================                
-                self._append_rollout_jsonl(
-                    log_filename,
-                    log_context,
-                    "environment_observation",
-                    {
-                        "turn": step,
-                        "observation_type": "initial" if step == 0 else "tool",
-                        "observation": obs_text if obs_text.strip() else "",
-                        "empty_observation": not bool(obs_text.strip()),
-                        "raw_observation_tokens": raw_text_len,
-                        "tool_status": {
-                            "done": tool_results.get("done"),
-                            "valid_action": tool_results.get("valid_action"),
-                            "reward": tool_results.get("reward"),
-                            "success": tool_results.get("success"),
-                            "processing_time_ms": tool_results.get("processing_time_ms"),
-                            "interact_time_ms": tool_results.get("interact_time_ms"),
-                            "response_size_mb": tool_results.get("response_size_mb"),
-                        },
+                # Keep detailed rollout logs off by default. Slow tool calls still
+                # get a compact attribution record for postmortem analysis.
+                env_log_payload = {
+                    "turn": step,
+                    "observation_type": "initial" if step == 0 else "tool",
+                    "empty_observation": not bool(obs_text.strip()),
+                    "raw_observation_chars": len(obs_text),
+                    "raw_observation_tokens": raw_text_len,
+                    "action_type": _extract_action_type(action_text),
+                    "action_preview": _text_preview(action_text),
+                    "prompt_tokens_before_observation": turn_start_length,
+                    "tool_status": {
+                        "done": tool_results.get("done"),
+                        "valid_action": tool_results.get("valid_action"),
+                        "reward": tool_results.get("reward"),
+                        "success": tool_results.get("success"),
+                        "processing_time_ms": tool_results.get("processing_time_ms"),
+                        "interact_time_ms": tool_results.get("interact_time_ms"),
+                        "client_queued_ms": tool_results.get("client_queued_ms"),
+                        "tool_queue_time_ms": tool_results.get("tool_queue_time_ms"),
+                        "response_size_mb": tool_results.get("response_size_mb"),
+                        "X-Process-Time": tool_results.get("X-Process-Time"),
                     },
-                )
-                # =================================================================
+                }
+                if _rollout_log_full_text():
+                    env_log_payload["observation"] = obs_text if obs_text.strip() else ""
+                else:
+                    env_log_payload["observation_preview"] = _text_preview(obs_text) if obs_text.strip() else ""
+
+                if _should_log_rollout_detail(request_id, "environment_observation", env_log_payload):
+                    self._append_rollout_jsonl(
+                        log_filename,
+                        log_context,
+                        "environment_observation",
+                        env_log_payload,
+                    )
 
                 # =====================================================================
                 # [视觉上下文压缩拦截器 (Observation-Level Compression)]
@@ -1511,7 +1641,7 @@ class VerlToolAgentLoop(AgentLoopBase):
                     compressed_img = compressed_img_list[0]
                     
                     img_path = f"{saved_dir}/compressed_obs_{request_id[-6:]}_step{step}.png"
-                    await loop.run_in_executor(None, compressed_img.save, img_path)
+                    # await loop.run_in_executor(None, compressed_img.save, img_path)
                     # self._append_rollout_jsonl(
                     #     log_filename,
                     #     log_context,
@@ -1659,7 +1789,16 @@ class VerlToolAgentLoop(AgentLoopBase):
                 if 'reward' in tool_results and tool_results['reward'] is not None:
                     stats_dict["rewards"].append(tool_results['reward'] if 'reward' in tool_results else 0.0)
                 stats_dict["valid_action"] += tool_results['valid_action'] if 'valid_action' in tool_results else 0
-                stats_dict["tool_interact_info"].append(tool_results)
+                if self.agent_config.compact_tool_interact_info and COMPACT_TOOL_INFO_INLINE:
+                    compact_info, prev_obs = compact_tool_interact_info_entry(
+                        tool_results,
+                        stats_dict.get("tool_interact_prev_obs", ""),
+                    )
+                    stats_dict["tool_interact_prev_obs"] = prev_obs
+                    stats_dict["tool_interact_info"].append(compact_info)
+                    stats_dict["tool_interact_info_compacted"] = True
+                else:
+                    stats_dict["tool_interact_info"].append(tool_results)
                 
                 running_prompt_ids.extend(obs_token_ids)
                 if self.agent_config.mask_observations:
@@ -1711,21 +1850,26 @@ class VerlToolAgentLoop(AgentLoopBase):
             token_stats["total_gen_tokens"] += len(gen_ids)
             # =====================================================================
 
-            # =================================================================
-            self._append_rollout_jsonl(
-                log_filename,
-                log_context,
-                "model_generation",
-                {
-                    "turn": step,
-                    "text": gen_text,
-                    "token_count": len(gen_ids),
-                    "finish_reason": output.finish_reason,
-                    "stop_reason": output.stop_reason,
-                    "mean_logprob": float(np.mean(gen_logprobs)) if len(gen_logprobs) > 0 else 0.0,
-                },
-            )
-            # =================================================================
+            gen_log_payload = {
+                "turn": step,
+                "token_count": len(gen_ids),
+                "text_chars": len(gen_text),
+                "finish_reason": output.finish_reason,
+                "stop_reason": output.stop_reason,
+                "mean_logprob": float(np.mean(gen_logprobs)) if len(gen_logprobs) > 0 else 0.0,
+            }
+            if _rollout_log_full_text():
+                gen_log_payload["text"] = gen_text
+            else:
+                gen_log_payload["text_preview"] = _text_preview(gen_text)
+
+            if _should_log_rollout_detail(request_id, "model_generation", gen_log_payload):
+                self._append_rollout_jsonl(
+                    log_filename,
+                    log_context,
+                    "model_generation",
+                    gen_log_payload,
+                )
 
             running_prompt_ids.extend(gen_ids)
             response_mask.extend([1] * len(gen_ids))
@@ -1990,7 +2134,7 @@ class VerlToolAgentLoop(AgentLoopBase):
         # =====================================================================
 
         tool_interact_info = stats_dict.get("tool_interact_info", [])
-        if self.agent_config.compact_tool_interact_info:
+        if self.agent_config.compact_tool_interact_info and not stats_dict.get("tool_interact_info_compacted", False):
             tool_interact_info = compact_tool_interact_info_entries(tool_interact_info)
 
         if self.agent_config.opd_enable and not kwargs.get("validate", False):

@@ -14,6 +14,17 @@ from .tools import get_tool_cls, ALL_TOOLS, set_use_tqdm
 logger = logging.getLogger(__name__)
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+TRACE_ACTION_PAYLOADS = _env_flag("TOOL_SERVER_TRACE_ACTION_PAYLOADS", False)
+INVALID_FETCH_OBS = _env_flag("TOOL_SERVER_INVALID_FETCH_OBS", False)
+
+
 # === RAY TOOL MANAGER ===
 class RayToolManager:
     """Distributed tool manager using Ray for high-performance processing"""
@@ -248,10 +259,10 @@ class RayToolManager:
         
         # 1. 优先检查并使用纯异步的 aget_observations (解决超时和死锁的终极方案)
         if hasattr(tool, 'aget_observations'):
-            logger.info(f"😯😯😯Processing {len(actions)} actions with ray tool (ASYNC BATCH): {tool_type}")
-            print(f"🤓🤓🤓actions:{list(actions)}")
-            print(f"😋😋😋extra_fields: {list(extra_fields)}")
-            
+            logger.debug("Processing %d actions with ray tool (async batch): %s", len(actions), tool_type)
+            if TRACE_ACTION_PAYLOADS:
+                logger.debug("actions=%s extra_fields=%s", list(actions), list(extra_fields))
+
             future = tool.aget_observations.remote(trajectory_ids, actions, extra_fields)
             # Ray 原生支持直接 await ObjectRef，这是最高效的做法
             import ray
@@ -261,13 +272,13 @@ class RayToolManager:
 
         # 2. 如果没有异步批处理，再检查旧的同步 get_observations
         elif hasattr(tool, 'get_observations'):
-            logger.info(f"😯😯😯Processing {len(actions)} actions with ray tool (SYNC BATCH): {tool_type}")
+            logger.debug("Processing %d actions with ray tool (sync batch): %s", len(actions), tool_type)
             future = tool.get_observations.remote(trajectory_ids, actions, extra_fields)
             return await self._ray_get_async(future)
 
         # 3. 如果连批处理都没有，尝试异步单条执行 aconduct_action
         elif hasattr(tool, 'aconduct_action'):
-            logger.info(f"😯😯😯Processing {len(actions)} actions with ray tool (ASYNC INDIVIDUAL): {tool_type}")
+            logger.debug("Processing %d actions with ray tool (async individual): %s", len(actions), tool_type)
             futures = [
                 tool.aconduct_action.remote(tid, action, extra)
                 for tid, action, extra in zip(trajectory_ids, actions, extra_fields)
@@ -280,7 +291,7 @@ class RayToolManager:
 
         # 4. 最底层的兜底：同步单条执行 conduct_action
         else:
-            logger.info(f"😯😯😯Processing {len(actions)} actions with ray tool (SYNC INDIVIDUAL): {tool_type}")
+            logger.debug("Processing %d actions with ray tool (sync individual): %s", len(actions), tool_type)
             futures = [
                 tool.conduct_action.remote(tid, action, extra)
                 for tid, action, extra in zip(trajectory_ids, actions, extra_fields)
@@ -328,7 +339,7 @@ class RayToolManager:
             tuple: (observations, dones, valids) for invalid actions
         """
         usage_instructions = self.get_usage_instructions()
-        text_browser_tool = self.tools.get("text_browser")
+        text_browser_tool = self.tools.get("text_browser") if INVALID_FETCH_OBS else None
         observations = []
         dones = []
         valids = []

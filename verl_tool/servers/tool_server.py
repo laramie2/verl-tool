@@ -29,7 +29,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEBUG=False
+def _env_flag(name: str, default: bool) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+DEBUG = _env_flag("TOOL_SERVER_DEBUG", False)
+TRACE_ACTION_PAYLOADS = _env_flag("TOOL_SERVER_TRACE_ACTION_PAYLOADS", False)
+INVALID_FETCH_OBS = _env_flag("TOOL_SERVER_INVALID_FETCH_OBS", False)
 
 # === MODELS ===
 class ActionRequest(BaseModel):
@@ -314,8 +323,8 @@ class AsyncToolManager:
         """Group actions by their assigned tool types"""
         groups = {}
         
-        print(f"😋😋😋tool_types: {list(tool_types)}")
-        print(f"🤓🤓🤓actions:{list(actions)}")
+        if TRACE_ACTION_PAYLOADS:
+            logger.debug("tool_types=%s actions=%s", list(tool_types), list(actions))
 
         for tool_type in set(tool_types):
             indices = [i for i, t in enumerate(tool_types) if t == tool_type]
@@ -346,7 +355,7 @@ class AsyncToolManager:
         """Handle actions that couldn't be matched to any tool"""
         usage_instructions = self.get_usage_instructions()
 
-        text_browser_tool = self.tools.get("text_browser")
+        text_browser_tool = self.tools.get("text_browser") if INVALID_FETCH_OBS else None
 
         for idx in indices:
             current_observation = None
@@ -391,18 +400,18 @@ class AsyncToolManager:
     
     def _create_tool_processing_task(self, tool_type: str, data: Tuple):
         """Create appropriate task for tool processing (async vs sync)"""
-        logger.info(f"tool_type: {tool_type}, data_length: {len(data[0]) if data else 'N/A'}")
+        logger.debug("tool_type=%s data_length=%s", tool_type, len(data[0]) if data else "N/A")
         tool = self.tools[tool_type]
         trajectory_ids, actions, extra_fields = data
         
         # Check if tool has async method
         if hasattr(tool, "aget_observations") and inspect.iscoroutinefunction(tool.aget_observations):
-            print(f"😯😯😯Processing {len(actions)} actions with async tool: {tool_type}")
+            logger.debug("Processing %d actions with async tool: %s", len(actions), tool_type)
             return asyncio.create_task(
                 tool.aget_observations(trajectory_ids, actions, extra_fields)
             )
         else:
-            print(f"😯😯😯Processing {len(actions)} actions with sync tool: {tool_type}")
+            logger.debug("Processing %d actions with sync tool: %s", len(actions), tool_type)
             # Use thread pool for sync methods
             return asyncio.get_event_loop().run_in_executor(
                 self.thread_pool,

@@ -1,18 +1,24 @@
 import asyncio
 import json
+import logging
 import multiprocessing as mp
 import os
 import re
 import signal
+import statistics
 import threading
 import time
 import traceback
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import ray
 
 from .base import BaseTool, register_tool
+
+
+logger = logging.getLogger(__name__)
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -50,6 +56,12 @@ ACTION_TIMEOUT_SEC = float(os.getenv("TEXT_BROWSER_ACTION_TIMEOUT_SEC", "75.0"))
 ENV_PROCESS_SHUTDOWN_TIMEOUT_SEC = float(
     os.getenv("TEXT_BROWSER_ENV_SHUTDOWN_TIMEOUT_SEC", "10.0")
 )
+PREWARM_IDLE_ACTORS = max(0, int(os.getenv("TEXT_BROWSER_PREWARM_ACTORS", "0")))
+PREWARM_ENV_PROCESS = _env_flag("TEXT_BROWSER_PREWARM_ENV_PROCESS", True)
+PREWARM_TIMEOUT_SEC = float(os.getenv("TEXT_BROWSER_PREWARM_TIMEOUT_SEC", "30.0"))
+TIMING_LOG_INTERVAL_SEC = float(os.getenv("TEXT_BROWSER_TIMING_LOG_INTERVAL_SEC", "30.0"))
+TIMING_WINDOW_SIZE = max(100, int(os.getenv("TEXT_BROWSER_TIMING_WINDOW_SIZE", "10000")))
+TIMING_SLOW_CALL_MS = float(os.getenv("TEXT_BROWSER_TIMING_SLOW_CALL_MS", "30000"))
 
 
 def _get_child_pids(pid: int) -> List[int]:
@@ -410,6 +422,18 @@ class WikiEnvActor:
     def ping(self) -> bool:
         return True
 
+    def warmup(self) -> bool:
+        self._begin_request()
+        try:
+            if PREWARM_ENV_PROCESS:
+                self._env_runtime.call(
+                    "ping",
+                    timeout=min(5.0, ENV_PROCESS_RPC_TIMEOUT_SEC),
+                )
+            return True
+        finally:
+            self._end_request()
+
     def execute(self, action: str, question: str, gt: str, url: str = None):
         self._begin_request()
         try:
@@ -456,6 +480,79 @@ class TextBrowserTool(BaseTool):
         self.idle_actors = []
         self.actor_num_cpus = ACTOR_CPU_FRACTION
         self._lock = threading.RLock()
+        self._timing_events = deque(maxlen=TIMING_WINDOW_SIZE)
+        self._last_timing_log = 0.0
+        self._prewarm_idle_actors()
+
+    def _prewarm_idle_actors(self):
+        count = min(PREWARM_IDLE_ACTORS, IDLE_ACTOR_POOL_SIZE)
+        if count <= 0:
+            return
+
+        actors = [self._new_actor() for _ in range(count)]
+        if PREWARM_ENV_PROCESS:
+            try:
+                ray.get([actor.warmup.remote() for actor in actors], timeout=PREWARM_TIMEOUT_SEC)
+            except Exception as exc:
+                logger.warning("TextBrowser actor prewarm did not fully complete: %s", exc)
+
+        with self._lock:
+            room = max(0, IDLE_ACTOR_POOL_SIZE - len(self.idle_actors))
+            self.idle_actors.extend(actors[:room])
+
+        for actor in actors[room:]:
+            self._discard_actor(actor)
+
+        logger.info("Prewarmed %d idle TextBrowser actors", min(count, IDLE_ACTOR_POOL_SIZE))
+
+    @staticmethod
+    def _p95(values):
+        if not values:
+            return 0.0
+        if len(values) < 20:
+            return max(values)
+        return statistics.quantiles(values, n=20)[-1]
+
+    def _record_timing(self, event: Dict[str, Union[int, float]]):
+        if TIMING_LOG_INTERVAL_SEC <= 0:
+            return
+
+        self._timing_events.append(event)
+        now = time.time()
+        if now - self._last_timing_log < TIMING_LOG_INTERVAL_SEC:
+            return
+        self._last_timing_log = now
+
+        events = list(self._timing_events)
+        if not events:
+            return
+
+        def vals(key):
+            return [float(item.get(key, 0.0)) for item in events]
+
+        total = vals("total_ms")
+        run = vals("actor_run_ms")
+        acquire = vals("actor_acquire_ms")
+        cleanup = vals("cleanup_ms")
+        logger.info(
+            "[TEXT_BROWSER_TIMING] "
+            "n=%d total_avg_ms=%.1f total_p95_ms=%.1f run_avg_ms=%.1f "
+            "run_p95_ms=%.1f acquire_avg_ms=%.1f cleanup_avg_ms=%.1f "
+            "created=%d done=%d invalid=%d timeout=%d error=%d slow=%d",
+            len(events),
+            sum(total) / len(total),
+            self._p95(total),
+            sum(run) / len(run),
+            self._p95(run),
+            sum(acquire) / len(acquire),
+            sum(cleanup) / len(cleanup),
+            sum(int(item.get("actor_created", 0)) for item in events),
+            sum(int(item.get("done", 0)) for item in events),
+            sum(int(item.get("invalid", 0)) for item in events),
+            sum(int(item.get("timeout", 0)) for item in events),
+            sum(int(item.get("error", 0)) for item in events),
+            sum(1 for item in events if float(item.get("total_ms", 0.0)) >= TIMING_SLOW_CALL_MS),
+        )
 
     def get_usage_inst(self) -> str:
         return "TextBrowserTool uses Ray actors to manage WikiQAEnv sessions."
@@ -662,19 +759,54 @@ class TextBrowserTool(BaseTool):
         return obs, done, valid
 
     async def aconduct_action(self, trajectory_id: str, action: str, extra_field: dict):
-        actor = self.load_env(trajectory_id)
-        if actor is None:
-            actor = self._acquire_actor()
-            await self.asave_env(trajectory_id, actor)
+        call_start = time.perf_counter()
+        timing: Dict[str, Union[int, float]] = {
+            "actor_created": 0,
+            "done": 0,
+            "invalid": 0,
+            "timeout": 0,
+            "error": 0,
+            "actor_acquire_ms": 0.0,
+            "actor_run_ms": 0.0,
+            "cleanup_ms": 0.0,
+        }
+
+        actor = None
+        obs = ""
+        done = False
+        valid = True
 
         try:
+            actor = self.load_env(trajectory_id)
+            if actor is None:
+                acquire_start = time.perf_counter()
+                actor = self._acquire_actor()
+                await self.asave_env(trajectory_id, actor)
+                timing["actor_created"] = 1
+                timing["actor_acquire_ms"] = (time.perf_counter() - acquire_start) * 1000
+
+            run_start = time.perf_counter()
             obs, done, valid = await self._arun_actor(actor, action, extra_field)
+            timing["actor_run_ms"] = (time.perf_counter() - run_start) * 1000
+
         except asyncio.TimeoutError:
+            timing["timeout"] = 1
+            timing["invalid"] = 1
+            cleanup_start = time.perf_counter()
             await self.adelete_env(trajectory_id, discard_actor=True)
+            timing["cleanup_ms"] = (time.perf_counter() - cleanup_start) * 1000
             return "[TIMEOUT] (aconduct_action)", True, False
         except Exception as exc:
+            timing["error"] = 1
+            timing["invalid"] = 1
+            cleanup_start = time.perf_counter()
             await self.adelete_env(trajectory_id, discard_actor=True)
+            timing["cleanup_ms"] = (time.perf_counter() - cleanup_start) * 1000
             return f"Error: {exc}", False, False
+        finally:
+            if timing.get("timeout") or timing.get("error"):
+                timing["total_ms"] = (time.perf_counter() - call_start) * 1000
+                self._record_timing(timing)
 
         self._touch_actor(trajectory_id)
         obs_before_cleanup = obs
@@ -682,7 +814,9 @@ class TextBrowserTool(BaseTool):
         if done:
             if valid:
                 obs = ""
+            cleanup_start = time.perf_counter()
             await self.adelete_env(trajectory_id, reset_actor=False)
+            timing["cleanup_ms"] = (time.perf_counter() - cleanup_start) * 1000
 
         if not valid:
             obs = (
@@ -690,6 +824,10 @@ class TextBrowserTool(BaseTool):
                 f"Current observation:\n{obs_before_cleanup}"
             )
 
+        timing["done"] = int(bool(done))
+        timing["invalid"] = int(not bool(valid))
+        timing["total_ms"] = (time.perf_counter() - call_start) * 1000
+        self._record_timing(timing)
         return obs, done, valid
 
     def _maybe_log_batch(self, trajectory_ids, actions, extra_fields, observations, dones, valid_flags):
