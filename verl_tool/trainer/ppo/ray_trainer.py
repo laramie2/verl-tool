@@ -466,6 +466,8 @@ class AgentRayPPOTrainer(RayPPOTrainer):
         best_checkpoint_metric_key = None
         best_checkpoint_metric_value = None
         best_checkpoint_step = None
+        last_validation_step = None
+        last_completed_step = None
         self._load_checkpoint()
 
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
@@ -475,6 +477,7 @@ class AgentRayPPOTrainer(RayPPOTrainer):
             if save_best_by_metric:
                 best_checkpoint_metric_key, best_checkpoint_metric_value = self._get_best_checkpoint_metric(val_metrics)
                 best_checkpoint_step = self.global_steps if best_checkpoint_metric_key is not None else None
+                last_validation_step = self.global_steps
                 if best_checkpoint_metric_key is not None:
                     print(
                         "Initial best checkpoint metric baseline: "
@@ -709,6 +712,7 @@ class AgentRayPPOTrainer(RayPPOTrainer):
                 ):
                     with marked_timer("testing", timing_raw, color="green"):
                         val_metrics: dict = self._validate()
+                        last_validation_step = self.global_steps
                         if is_last_step:
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)
@@ -805,6 +809,7 @@ class AgentRayPPOTrainer(RayPPOTrainer):
                 logger.log(data=metrics, step=self.global_steps)
 
                 progress_bar.update(1)
+                last_completed_step = self.global_steps
                 self.global_steps += 1
                 self.gen_steps += 1
 
@@ -847,7 +852,68 @@ class AgentRayPPOTrainer(RayPPOTrainer):
                 num_prompt_in_batch = 0
                 num_gen_batches = 0
                 _cleanup_step_memory()
-    
+
+        if (
+            last_completed_step is not None
+            and self.val_reward_fn is not None
+            and self.config.trainer.test_freq > 0
+            and last_validation_step != last_completed_step
+        ):
+            original_global_steps = self.global_steps
+            self.global_steps = last_completed_step
+            final_metrics = {"training/global_step": self.global_steps}
+            final_timing_raw = defaultdict(float)
+
+            try:
+                with marked_timer("final_testing", final_timing_raw, color="green"):
+                    final_val_metrics: dict = self._validate()
+                last_validation_step = self.global_steps
+                final_metrics.update(final_val_metrics)
+
+                save_due_to_best_metric = False
+                if save_best_by_metric and final_val_metrics:
+                    metric_key, metric_value = self._get_best_checkpoint_metric(final_val_metrics)
+                    if metric_key is not None:
+                        improved = self._is_better_checkpoint_metric(metric_value, best_checkpoint_metric_value)
+                        final_metrics["checkpoint/best_metric_current"] = metric_value
+                        final_metrics["checkpoint/best_metric_value"] = (
+                            metric_value
+                            if improved
+                            else (
+                                best_checkpoint_metric_value
+                                if best_checkpoint_metric_value is not None
+                                else float("nan")
+                            )
+                        )
+                        final_metrics["checkpoint/best_metric_improved"] = float(improved)
+                        if improved:
+                            best_checkpoint_metric_key = metric_key
+                            best_checkpoint_metric_value = metric_value
+                            best_checkpoint_step = self.global_steps
+                            save_due_to_best_metric = True
+                            print(
+                                "New best checkpoint metric at final validation: "
+                                f"{metric_key}={metric_value} at step {self.global_steps}"
+                            )
+                        else:
+                            print(
+                                "Final checkpoint metric did not improve: "
+                                f"{metric_key}={metric_value}, best={best_checkpoint_metric_value} "
+                                f"at step {best_checkpoint_step}"
+                            )
+
+                if save_due_to_best_metric:
+                    print(f"Saving checkpoint at step {self.global_steps}; reasons=best_metric,final_validation")
+                    with marked_timer("save_checkpoint", final_timing_raw, color="green"):
+                        self._save_checkpoint()
+
+                logger.log(data=final_metrics, step=self.global_steps)
+                pprint(f"Final validation metrics: {final_val_metrics}")
+            finally:
+                self.global_steps = original_global_steps
+
+        progress_bar.close()
+
     def _validate(self):
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
