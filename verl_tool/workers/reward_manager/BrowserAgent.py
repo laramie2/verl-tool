@@ -181,6 +181,7 @@ def browser_dense_turn_rewards(
     query_weight: float = 0.05,
     action_penalty_weight: float = 0.05,
     retrieval_decay: float = 0.05,
+    repeat_retrieval_penalty_ratio: float = 0.25,
 ) -> list[dict]:
     """Build token-span aware turn rewards from compact browser interaction logs."""
     if isinstance(tool_interact_info, np.ndarray):
@@ -189,6 +190,7 @@ def browser_dense_turn_rewards(
     infos = [info for info in (tool_interact_info or []) if isinstance(info, dict)]
     query_scores = atomic_query_scores(infos)
     turns: dict[int, dict] = {}
+    repeat_retrieval_penalty_ratio = max(0.0, float(repeat_retrieval_penalty_ratio))
 
     def ensure_turn(turn) -> dict | None:
         if not isinstance(turn, (int, np.integer)) or int(turn) < 0:
@@ -201,6 +203,7 @@ def browser_dense_turn_rewards(
                 "response_start": -1,
                 "response_end": -1,
                 "retrieval": 0.0,
+                "repeat_retrieval_penalty": 0.0,
                 "refinement": 0.0,
                 "query": 0.0,
                 "action_penalty": 0.0,
@@ -211,13 +214,21 @@ def browser_dense_turn_rewards(
     for info in infos:
         action_turn_entry = ensure_turn(info.get("action_turn_index"))
         if action_turn_entry is not None:
+            action = extract_browser_action(str(info.get("action", "")))
+            decay = float(np.exp(-retrieval_decay * action_turn_entry["turn"]))
             retrieval_delta = float(info.get("retrieval_delta", 0.0) or 0.0)
             if retrieval_delta > 0:
-                decay = float(np.exp(-retrieval_decay * action_turn_entry["turn"]))
                 action_turn_entry["retrieval"] += retrieval_delta * decay
+            elif (
+                action
+                and float(info.get("gt_match_score", 0.0) or 0.0) > 0.0
+                and not bool(info.get("first_gt_hit", False))
+            ):
+                penalty = repeat_retrieval_penalty_ratio * decay
+                action_turn_entry["retrieval"] -= penalty
+                action_turn_entry["repeat_retrieval_penalty"] -= penalty
             action_turn_entry["query"] += float(query_scores.get(action_turn_entry["turn"], 0.0))
 
-            action = extract_browser_action(str(info.get("action", "")))
             bad_action = bool(action) and (
                 info.get("valid_action") in (0, False)
                 or info.get("target_id_exists") is False
@@ -367,6 +378,15 @@ class WikiRLRewardManager:
                 0.05,
             ),
             0.05,
+        )
+        self.repeat_retrieval_penalty_ratio = _as_float(
+            _config_value(
+                kwargs,
+                "repeat_retrieval_penalty_ratio",
+                "BROWSER_AGENT_REPEAT_RETRIEVAL_PENALTY_RATIO",
+                0.25,
+            ),
+            0.25,
         )
         if "record_dir" in kwargs:
             self.record_dir = Path(kwargs['record_dir'])
@@ -553,6 +573,7 @@ class WikiRLRewardManager:
         turn_rewards = []
         dense_reward_sums = []
         dense_retrieval_rewards = []
+        dense_repeat_retrieval_penalties = []
         dense_refinement_rewards = []
         dense_query_rewards = []
         dense_action_penalties = []
@@ -589,12 +610,16 @@ class WikiRLRewardManager:
                     query_weight=self.query_reward_weight,
                     action_penalty_weight=self.action_penalty_turn_weight,
                     retrieval_decay=self.retrieval_decay,
+                    repeat_retrieval_penalty_ratio=self.repeat_retrieval_penalty_ratio,
                 )
                 if self.enable_process_reward
                 else []
             )
             dense_reward_sum = float(sum(item.get("reward", 0.0) for item in dense_turn_reward))
             dense_retrieval_sum = float(sum(item.get("retrieval", 0.0) for item in dense_turn_reward))
+            dense_repeat_retrieval_penalty_sum = float(
+                sum(item.get("repeat_retrieval_penalty", 0.0) for item in dense_turn_reward)
+            )
             dense_refinement_sum = float(sum(item.get("refinement", 0.0) for item in dense_turn_reward))
             dense_query_sum = float(sum(item.get("query", 0.0) for item in dense_turn_reward))
             dense_action_penalty_sum = float(sum(item.get("action_penalty", 0.0) for item in dense_turn_reward))
@@ -621,6 +646,7 @@ class WikiRLRewardManager:
             turn_rewards.append({"turns": dense_turn_reward})
             dense_reward_sums.append(dense_reward_sum)
             dense_retrieval_rewards.append(dense_retrieval_sum)
+            dense_repeat_retrieval_penalties.append(dense_repeat_retrieval_penalty_sum)
             dense_refinement_rewards.append(dense_refinement_sum)
             dense_query_rewards.append(dense_query_sum)
             dense_action_penalties.append(dense_action_penalty_sum)
@@ -691,6 +717,7 @@ class WikiRLRewardManager:
                     "browser_process_penalty": process_penalties,
                     "browser_dense_reward_sum": dense_reward_sums,
                     "browser_dense_retrieval_reward": dense_retrieval_rewards,
+                    "browser_dense_repeat_retrieval_penalty": dense_repeat_retrieval_penalties,
                     "browser_dense_refinement_reward": dense_refinement_rewards,
                     "browser_dense_query_reward": dense_query_rewards,
                     "browser_dense_action_penalty": dense_action_penalties,
