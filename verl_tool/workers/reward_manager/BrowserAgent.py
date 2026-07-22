@@ -384,7 +384,7 @@ class WikiRLRewardManager:
                 kwargs,
                 "repeat_retrieval_penalty_ratio",
                 "BROWSER_AGENT_REPEAT_RETRIEVAL_PENALTY_RATIO",
-                0.25,
+                0.0,
             ),
             0.25,
         )

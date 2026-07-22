@@ -1631,7 +1631,7 @@ class VerlToolAgentLoop(AgentLoopBase):
                         visible_chars += len(line)
                     reward_visible_obs = " ".join(visible_lines)
                     
-                    COMPRESSION_FACTOR = 1.5 
+                    COMPRESSION_FACTOR = 1.2
                     compressed_img_list = await loop.run_in_executor(
                         None, 
                         self.vtc.compress_image_arrays, 
