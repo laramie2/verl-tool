@@ -677,10 +677,14 @@ def main(
             import ray
             if not ray.is_initialized():
                 logger.info("[MAIN] Initializing Ray cluster...")
-                ray.init(
-                    ignore_reinit_error=True,
-                    log_to_driver=False,
-                )
+                ray_init_kwargs = {
+                    "ignore_reinit_error": True,
+                    "log_to_driver": False,
+                }
+                ray_num_cpus = os.getenv("TEXT_BROWSER_RAY_NUM_CPUS", "").strip()
+                if ray_num_cpus:
+                    ray_init_kwargs["num_cpus"] = int(ray_num_cpus)
+                ray.init(**ray_init_kwargs)
                 logger.info(f"[MAIN] Ray initialized: {ray.cluster_resources()}")
             else:
                 logger.info("[MAIN] Ray already initialized, reusing existing cluster")
