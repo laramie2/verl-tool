@@ -2,19 +2,18 @@
 
 set -x
 
-export WANDB_API_KEY=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
-export PYTHONPATH=$PYTHONPATH:/data/yutao/lzt/BrowserAgent_v2
-# export PYTHONPATH=$PYTHONPATH:$(pwd)/..:$(pwd)/../..
+REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)
+export PYTHONPATH="${PYTHONPATH:+${PYTHONPATH}:}${REPO_ROOT}"
 
 export CUDA_VISIBLE_DEVICES=4,5,6,7
 
-LOG_DIR="/data/yutao/lzt/BrowserAgent_v2/verl-tool/logs"
-mkdir -p $LOG_DIR
+LOG_DIR=${LOG_DIR:-${REPO_ROOT}/verl-tool/logs}
+mkdir -p "$LOG_DIR"
 
 dataset_name=browseragent
 train_data=$(pwd)/data/${dataset_name}/train.parquet
 val_data=$(pwd)/data/${dataset_name}/test.parquet
-model_name=/data/yutao/lzt/BrowserAgent_v2/verl-tool/models/Qwen/Qwen2.5-VL-7B-Instruct
+model_name=${MODEL_PATH:-${REPO_ROOT}/models/Qwen2.5-VL-7B-Instruct}
 rl_alg=grpo # gae(ppo) or grpo, if grpo, then better set n>1 otherwise the group norm can not be effective
 n_gpus_per_node=4
 n_nodes=1

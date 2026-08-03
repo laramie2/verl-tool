@@ -3,7 +3,7 @@ dataset_name=deepsearch # or math_torl_offical to use torl training data
 train_data=$(pwd)/data/${dataset_name}/hard_search_1k.parquet
 val_data=[$(pwd)/data/${dataset_name}/gaia_test.parquet,\
 $(pwd)/data/${dataset_name}/hle_test.parquet]
-model_name=/data/yutao/lzt/BrowserAgent_v2/verl-tool/models/Qwen/Qwen3-4B
+model_name=${MODEL_PATH:-$(pwd)/models/Qwen/Qwen3-4B}
 rl_alg=grpo # gae(ppo) or grpo, if grpo, then better set n>1 otherwise the group norm can not be effective
 n_gpus_per_node=8
 n_nodes=1
